@@ -57,7 +57,8 @@ configure_console()
 # How similar the speaker's voice must be to the enrolled voice (0.0 – 1.0).
 # Higher = stricter (fewer false accepts but may reject the real user more).
 # Lower  = looser  (more permissive but may accept imposters).
-SIMILARITY_THRESHOLD = 0.75
+# Lowered for easier real-world use with the project microphone setup.
+SIMILARITY_THRESHOLD = 0.65
 
 SAMPLE_RATE       = 16_000          # samples per second (16 kHz = Vosk/Resemblyzer standard)
 RECORDING_SECONDS = 3               # how long we record each command
@@ -113,13 +114,17 @@ def parse_command(text: str) -> str | None:
     """
     Check if the transcribed text contains a recognised fan command.
 
-    We use a word-set check so "please turn the fan on" still triggers "on".
+    We use a word-set check so phrases like "please turn the fan on" still
+    trigger "on". We also accept common mis-hears such as "and on", "and off",
+    and Vosk's frequent "of" for "off".
     Returns "on", "off", or None (unknown command).
     """
     words = set(text.split())  # split into individual words for flexible matching
-    if "fan" in words and "on" in words:
+    if ("fan" in words and "on" in words) or ("and" in words and "on" in words):
         return "on"
-    if "fan" in words and "off" in words:
+    if ("fan" in words and "off" in words) or ("and" in words and "off" in words):
+        return "off"
+    if ("fan" in words and "of" in words) or ("and" in words and "of" in words):
         return "off"
     return None  # command not recognised
 
