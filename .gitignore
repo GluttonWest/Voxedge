@@ -6,3 +6,18 @@ command.wav
 enrolled_voice.npy
 enrollment/*.wav
 model/
+
+# Backend
+backend/.venv/
+backend/.env
+backend/*.db*
+backend/__pycache__/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# IDE
+.vscode/
+.idea/

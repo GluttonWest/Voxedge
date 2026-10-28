@@ -1,0 +1,1 @@
+"""VoxEdge backend application package."""

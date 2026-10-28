@@ -1,0 +1,32 @@
+# ── Web framework ──────────────────────────────────────
+fastapi
+uvicorn[standard]
+python-multipart
+
+# ── Database ───────────────────────────────────────────
+sqlalchemy
+aiosqlite
+
+# ── Validation & config ────────────────────────────────
+pydantic
+pydantic-settings
+python-dotenv
+
+# ── Evaluation & data ─────────────────────────────────
+numpy
+pandas
+scikit-learn
+
+# ── Voice / speech (same as Phase 1) ──────────────────
+vosk
+sounddevice
+soundfile
+resemblyzer
+webrtcvad-wheels
+librosa
+torch
+setuptools<81
+
+# ── Testing ────────────────────────────────────────────
+pytest
+httpx
