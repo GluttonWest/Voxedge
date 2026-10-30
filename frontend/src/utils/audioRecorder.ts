@@ -1,9 +1,9 @@
 /**
- * audioRecorder.ts — Browser PCM Audio Recorder that produces clean 16 kHz Mono WAV files.
+ * audioRecorder.ts — Browser PCM Audio Recorder that produces clean 16-bit Mono WAV blobs.
  *
- * Captures raw microphone audio via Web Audio API AudioContext,
- * downsamples to 16,000 Hz, and builds a standard RIFF PCM 16-bit WAV blob.
- * This ensures 100% compatibility with Vosk, Resemblyzer, and libsndfile.
+ * Captures raw microphone audio via Web Audio API AudioContext.
+ * Ensures microphone output is muted to speakers (gain = 0) to prevent acoustic feedback
+ * and echo-cancellation pumping. Encodes clean RIFF PCM 16-bit WAV with exact sample rate metadata.
  */
 
 export class AudioRecorder {
@@ -11,6 +11,7 @@ export class AudioRecorder {
   private audioContext: AudioContext | null = null;
   private sourceNode: MediaStreamAudioSourceNode | null = null;
   private processorNode: ScriptProcessorNode | null = null;
+  private muteGainNode: GainNode | null = null;
   private recordedSamples: Float32Array[] = [];
   private totalLength = 0;
   private recording = false;
@@ -25,7 +26,7 @@ export class AudioRecorder {
     this.recordedSamples = [];
     this.totalLength = 0;
 
-    // Request microphone access
+    // Request microphone access with echo cancellation & noise suppression
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
@@ -37,7 +38,13 @@ export class AudioRecorder {
 
     const AudioContextClass =
       window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    this.audioContext = new AudioContextClass();
+
+    // Try requesting 16,000 Hz native context first for optimal hardware resampling
+    try {
+      this.audioContext = new AudioContextClass({ sampleRate: 16000 });
+    } catch {
+      this.audioContext = new AudioContextClass();
+    }
 
     this.sourceNode = this.audioContext.createMediaStreamSource(this.mediaStream);
 
@@ -53,8 +60,13 @@ export class AudioRecorder {
       this.totalLength += copy.length;
     };
 
+    // Mute gain node: keeps Web Audio graph active while preventing audio from playing through speakers
+    this.muteGainNode = this.audioContext.createGain();
+    this.muteGainNode.gain.value = 0;
+
     this.sourceNode.connect(this.processorNode);
-    this.processorNode.connect(this.audioContext.destination);
+    this.processorNode.connect(this.muteGainNode);
+    this.muteGainNode.connect(this.audioContext.destination);
 
     this.recording = true;
   }
@@ -67,9 +79,10 @@ export class AudioRecorder {
     this.recording = false;
 
     // Disconnect audio graph
-    if (this.processorNode && this.sourceNode) {
+    if (this.processorNode && this.sourceNode && this.muteGainNode) {
       this.sourceNode.disconnect();
       this.processorNode.disconnect();
+      this.muteGainNode.disconnect();
     }
 
     // Stop all microphone tracks
@@ -78,13 +91,13 @@ export class AudioRecorder {
       this.mediaStream = null;
     }
 
-    const inputSampleRate = this.audioContext?.sampleRate || 44100;
+    const actualSampleRate = this.audioContext?.sampleRate || 16000;
     if (this.audioContext && this.audioContext.state !== 'closed') {
       await this.audioContext.close();
       this.audioContext = null;
     }
 
-    // Merge recorded buffers into single Float32Array
+    // Merge recorded chunks into single continuous Float32Array
     const merged = new Float32Array(this.totalLength);
     let offset = 0;
     for (const chunk of this.recordedSamples) {
@@ -92,43 +105,8 @@ export class AudioRecorder {
       offset += chunk.length;
     }
 
-    // Resample to 16,000 Hz if needed
-    const targetSampleRate = 16000;
-    const resampled =
-      inputSampleRate === targetSampleRate
-        ? merged
-        : this.resampleAudio(merged, inputSampleRate, targetSampleRate);
-
-    // Convert Float32Array (-1.0 to 1.0) to 16-bit PCM WAV Blob
-    return this.encodeWAV(resampled, targetSampleRate);
-  }
-
-  private resampleAudio(
-    audioData: Float32Array,
-    inputRate: number,
-    outputRate: number,
-  ): Float32Array {
-    if (inputRate === outputRate) return audioData;
-    const ratio = inputRate / outputRate;
-    const newLength = Math.round(audioData.length / ratio);
-    const result = new Float32Array(newLength);
-    let offsetResult = 0;
-    let offsetSource = 0;
-
-    while (offsetResult < newLength) {
-      const nextOffsetSource = Math.round((offsetResult + 1) * ratio);
-      let accum = 0;
-      let count = 0;
-      for (let i = offsetSource; i < nextOffsetSource && i < audioData.length; i++) {
-        accum += audioData[i];
-        count++;
-      }
-      result[offsetResult] = count > 0 ? accum / count : 0;
-      offsetResult++;
-      offsetSource = nextOffsetSource;
-    }
-
-    return result;
+    // Encode directly as 16-bit PCM WAV preserving actual sample rate in header
+    return this.encodeWAV(merged, actualSampleRate);
   }
 
   private encodeWAV(samples: Float32Array, sampleRate: number): Blob {
@@ -146,8 +124,8 @@ export class AudioRecorder {
     view.setUint16(20, 1, true); // AudioFormat (1 for PCM)
     view.setUint16(22, 1, true); // NumChannels (1 = Mono)
     view.setUint32(24, sampleRate, true); // SampleRate
-    view.setUint32(28, sampleRate * 2, true); // ByteRate (SampleRate * NumChannels * BitsPerSample/8)
-    view.setUint16(32, 2, true); // BlockAlign (NumChannels * BitsPerSample/8)
+    view.setUint32(28, sampleRate * 2, true); // ByteRate (SampleRate * 1 * 16/8)
+    view.setUint16(32, 2, true); // BlockAlign (1 * 16/8)
     view.setUint16(34, 16, true); // BitsPerSample (16 bits)
 
     // data subchunk
@@ -171,4 +149,3 @@ export class AudioRecorder {
     }
   }
 }
-

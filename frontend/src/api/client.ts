@@ -52,10 +52,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const getEnrollmentStatus = () =>
   request<EnrollmentStatus>('/voice/enrollment-status');
 
-export const deleteVoiceProfile = () =>
-  request<{ success: boolean; message: string }>('/voice/profile', {
+export const deleteVoiceProfile = async () => {
+  setAuthToken(null);
+  return request<{ success: boolean; message: string }>('/voice/profile', {
     method: 'DELETE',
   });
+};
 
 export const enrollVoice = async (
   audioBlob: Blob,

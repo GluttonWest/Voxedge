@@ -221,29 +221,31 @@ def command_loop(fan: FanSimulator, stop_event: threading.Event) -> None:
             # ── Step 1: Record ───────────────────────────────────────────────
             record_command()
 
-            # ── Step 2: Transcribe with Vosk ─────────────────────────────────
-            text = transcribe_command(model)
-            print(f"\n  [SPEECH]  Transcribed text : \"{text or '[nothing recognised]'}\"")
-
-            # ── Step 3: Parse the command ─────────────────────────────────────
-            action = parse_command(text)
-            print(f"  [COMMAND] Parsed action    : {action or 'none (say fan on / fan off)'}")
-
-            # ── Step 4: Speaker verification ─────────────────────────────────
+            # ── Step 2: Mandatory Speaker Verification (FIRST) ───────────────
             similarity = compute_similarity(encoder, enrolled_embedding)
             verified   = similarity >= SIMILARITY_THRESHOLD
-            print(f"  [VOICE]   Similarity score : {similarity:.4f}  "
+            print(f"\n  [VOICE]   Similarity score : {similarity:.4f}  "
                   f"(threshold: {SIMILARITY_THRESHOLD})")
             print(f"  [VOICE]   Verification     : {'✔ PASSED' if verified else '✖ FAILED'}")
 
-            # ── Step 5: Decide outcome ────────────────────────────────────────
-            print()
             if not verified:
                 # Speaker is not recognised — deny access regardless of command
                 fan.root.after(0, fan.access_denied)
                 print(f"  ══ RESULT: ACCESS DENIED (score {similarity:.4f} < {SIMILARITY_THRESHOLD}) ══")
+                print("             Command rejected: voice does not match enrolled profile.")
+                continue
 
-            elif action == "on":
+            # ── Step 3: Transcribe with Vosk (Authenticated Path) ────────────
+            text = transcribe_command(model)
+            print(f"\n  [SPEECH]  Transcribed text : \"{text or '[nothing recognised]'}\"")
+
+            # ── Step 4: Parse the command ────────────────────────────────────
+            action = parse_command(text)
+            print(f"  [COMMAND] Parsed action    : {action or 'none (say fan on / fan off)'}")
+
+            # ── Step 5: Decide outcome ────────────────────────────────────────
+            print()
+            if action == "on":
                 fan.root.after(0, fan.turn_on)
                 print(f"  ══ RESULT: FAN TURNED ON  (score {similarity:.4f} ✔) ══")
 

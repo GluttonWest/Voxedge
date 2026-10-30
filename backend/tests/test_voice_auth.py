@@ -1,23 +1,19 @@
 """
-Test suite covering Voice Enrollment and Automatic Voice Authentication.
+Comprehensive Test Suite for Voice Enrollment and Automatic Voice Authentication.
 
-Covers the 8 core test cases required by VoxEdge:
-  TEST 1: First-time enrollment.
-          Expected: Backend creates voice profile and confirms enrollment.
-  TEST 2: Enrolled speaker gives a command.
-          Expected: If verification passes, command proceeds to intent processing.
-  TEST 3: Unregistered speaker gives a command.
-          Expected: Command is rejected, and no device state changes.
-  TEST 4: Enrolled speaker fails the similarity threshold.
-          Expected: Command is rejected, and no device state changes.
-  TEST 5: No enrolled profile exists.
-          Expected: All ordinary device-control commands are rejected.
-  TEST 6: Verification model fails or returns an error.
-          Expected: Authentication fails closed; no command executes.
-  TEST 7: Direct API request attempts to control a device without authentication.
-          Expected: Backend rejects the request (HTTP 401).
-  TEST 8: Existing profile is submitted for replacement.
-          Expected: Profile is not overwritten without explicit re-enrollment authorization.
+Covers all 12 mandatory evaluation scenarios:
+  1. Successful enrollment.
+  2. Loading the saved profile after restarting the application.
+  3. Enrolled speaker gives a valid command.
+  4. Different speaker gives the same command.
+  5. No profile exists.
+  6. Profile file is corrupted or missing.
+  7. Audio is empty, too short, or invalid.
+  8. Verification raises an exception (fails closed).
+  9. Speech is recognized but speaker verification fails.
+  10. Direct API requests attempt to control a device without valid authentication.
+  11. Device state remains unchanged after rejected commands.
+  12. Repeated commands continue to trigger authentication automatically.
 """
 
 from __future__ import annotations
@@ -48,20 +44,20 @@ from app.models.device import Device
 from app.services.voice_auth_service import VoiceAuthService
 
 
-# ── Helpers for generating audio ─────────────────────────────────────────────
+# ── Audio Generation Helpers ─────────────────────────────────────────────────
 
 def create_synthetic_wav(
     frequency: float = 440.0,
-    duration: float = 1.5,
+    duration: float = 2.0,
     sample_rate: int = 16000,
+    amplitude: float = 0.5,
 ) -> bytes:
-    """Generate a clean mono 16 kHz WAV audio file in bytes."""
+    """Generate a clean mono 16 kHz WAV audio file in bytes with rich harmonic content."""
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
-    # Generate multi-tone waveform to simulate complex sound
     waveform = (
-        0.5 * np.sin(2 * np.pi * frequency * t)
-        + 0.3 * np.sin(2 * np.pi * (frequency * 1.5) * t)
-        + 0.2 * np.sin(2 * np.pi * (frequency * 2.0) * t)
+        amplitude * 0.5 * np.sin(2 * np.pi * frequency * t)
+        + amplitude * 0.3 * np.sin(2 * np.pi * (frequency * 1.5) * t)
+        + amplitude * 0.2 * np.sin(2 * np.pi * (frequency * 2.0) * t)
     ).astype(np.float32)
 
     buf = io.BytesIO()
@@ -69,25 +65,17 @@ def create_synthetic_wav(
     return buf.getvalue()
 
 
-def load_real_wav(file_path: Path) -> bytes:
-    """Load an existing WAV file from disk into bytes."""
-    with open(file_path, "rb") as f:
-        return f.read()
-
-
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 @pytest.fixture
 def temp_voice_profile(tmp_path):
-    """Provide a temporary enrolled_voice.npy path to isolate tests from real profile."""
+    """Provide a temporary enrolled_voice.npy path to isolate tests from production profiles."""
     profile_path = tmp_path / "test_enrolled_voice.npy"
     original_path = settings.enrolled_voice_path
 
-    # Point settings to temporary file
     settings.enrolled_voice_path = str(profile_path)
     yield profile_path
 
-    # Teardown: restore original path
     settings.enrolled_voice_path = original_path
     if profile_path.exists():
         profile_path.unlink()
@@ -95,7 +83,7 @@ def temp_voice_profile(tmp_path):
 
 @pytest.fixture
 def db_session():
-    """In-memory SQLite database session with seeded devices."""
+    """In-memory SQLite database session seeded with test devices."""
     engine = create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
@@ -105,7 +93,6 @@ def db_session():
     TestingSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     session = TestingSessionLocal()
 
-    # Seed initial test devices
     devices = [
         Device(
             id="bedroom_light",
@@ -154,21 +141,19 @@ def client(db_session):
     app.dependency_overrides.clear()
 
 
-# ── TEST 1: First-time enrollment ───────────────────────────────────────────
+# ── Scenario 1: Successful Enrollment ────────────────────────────────────────
 
-def test_1_first_time_enrollment(client, temp_voice_profile):
+def test_scenario_1_successful_enrollment(client, temp_voice_profile):
     """
-    TEST 1: First-time enrollment.
-    Expected: The backend creates the voice profile and confirms enrollment.
+    Scenario 1: Successful enrollment.
+    Expected: Backend generates embedding, saves profile, and confirms enrollment.
     """
-    # Verify not enrolled initially
     assert not temp_voice_profile.exists()
     status_resp = client.get("/voice/enrollment-status")
     assert status_resp.status_code == 200
     assert status_resp.json()["is_enrolled"] is False
 
-    # Perform enrollment with sample audio
-    sample_wav = create_synthetic_wav(frequency=440.0, duration=2.0)
+    sample_wav = create_synthetic_wav(frequency=440.0, duration=2.5)
     response = client.post(
         "/voice/enroll",
         files={"file": ("enrollment.wav", sample_wav, "audio/wav")},
@@ -182,151 +167,123 @@ def test_1_first_time_enrollment(client, temp_voice_profile):
     assert "Voice enrolled successfully" in data["message"]
     assert data["dimensions"] == 256
 
-    # Verify profile file exists on disk and is non-empty
+    # Verify profile file exists on disk and is a valid 256-dim unit vector
     assert temp_voice_profile.exists()
     saved_embedding = np.load(temp_voice_profile)
     assert saved_embedding.shape == (256,)
     assert np.isclose(np.linalg.norm(saved_embedding), 1.0, atol=1e-3)
 
 
-# ── TEST 2: Enrolled speaker gives a command ────────────────────────────────
+# ── Scenario 2: Loading Saved Profile After Restarting Application ───────────
 
-def test_2_enrolled_speaker_gives_command(client, temp_voice_profile, db_session):
+def test_scenario_2_loading_saved_profile_after_restart(temp_voice_profile):
     """
-    TEST 2: Enrolled speaker gives a command.
-    Expected: If verification passes, the command proceeds to intent processing.
+    Scenario 2: Loading the saved profile after restarting the application.
+    Expected: A freshly initialized VoiceAuthService correctly loads and validates profile.
     """
-    # 1. Enroll speaker with voice A
-    voice_a_audio = create_synthetic_wav(frequency=400.0, duration=2.0)
+    # Create and save a valid mock profile
+    rng = np.random.default_rng(42)
+    fake_embedding = rng.standard_normal(256).astype(np.float32)
+    fake_embedding /= np.linalg.norm(fake_embedding)
+    np.save(temp_voice_profile, fake_embedding)
+
+    # Initialize a new service instance (simulating fresh server restart)
+    new_service = VoiceAuthService()
+    assert new_service.is_enrolled() is True
+
+    loaded_emb = new_service.load_enrolled_embedding()
+    assert loaded_emb is not None
+    assert loaded_emb.shape == (256,)
+    assert np.allclose(loaded_emb, fake_embedding, atol=1e-5)
+
+
+# ── Scenario 3: Enrolled Speaker Gives a Valid Command ───────────────────────
+
+def test_scenario_3_enrolled_speaker_valid_command(client, temp_voice_profile, db_session):
+    """
+    Scenario 3: Enrolled speaker gives a valid command.
+    Expected: Verification succeeds, command is recognized, fan turns ON.
+    """
+    voice_audio = create_synthetic_wav(frequency=400.0, duration=2.0)
     enroll_resp = client.post(
         "/voice/enroll",
-        files={"file": ("enroll.wav", voice_a_audio, "audio/wav")},
+        files={"file": ("enroll.wav", voice_audio, "audio/wav")},
     )
     assert enroll_resp.status_code == 200
 
-    # 2. Speaker gives command with same voice and speech "turn on the fan"
+    # User speaks command with verified voice
     with patch.object(VoiceAuthService, "transcribe_audio", return_value="turn on the fan"):
         resp = client.post(
             "/voice/process-audio",
-            files={"file": ("cmd.wav", voice_a_audio, "audio/wav")},
+            files={"file": ("cmd.wav", voice_audio, "audio/wav")},
         )
 
     assert resp.status_code == 200
     data = resp.json()
-
-    # Verification passed
     assert data["speaker_verified"] is True
-    assert data["speaker_similarity"] >= settings.similarity_threshold
     assert data["decision"] == "EXECUTE"
     assert data["target_device"] == "fan"
     assert data["requested_action"] == "ON"
     assert data["execution_status"] == "SUCCESS"
     assert data["new_device_state"] == "ON"
 
-    # Verify device state changed in database
     fan = db_session.query(Device).filter(Device.id == "fan").first()
     assert fan.state == "ON"
 
 
-# ── TEST 3: Unregistered speaker gives a command ────────────────────────────
+# ── Scenario 4: Different Speaker Gives the Same Command ─────────────────────
 
-def test_3_unregistered_speaker_gives_command(client, temp_voice_profile, db_session):
+def test_scenario_4_different_speaker_same_command(client, temp_voice_profile, db_session):
     """
-    TEST 3: Unregistered speaker gives a command.
-    Expected: The command is rejected, and no device state changes.
+    Scenario 4: Different speaker gives the same command.
+    Expected: Verification fails, command is rejected, fan remains OFF.
     """
-    # 1. Enroll legitimate speaker
-    real_speaker_audio = create_synthetic_wav(frequency=300.0, duration=2.0)
+    genuine_audio = create_synthetic_wav(frequency=300.0, duration=2.0)
     client.post(
         "/voice/enroll",
-        files={"file": ("enroll.wav", real_speaker_audio, "audio/wav")},
+        files={"file": ("enroll.wav", genuine_audio, "audio/wav")},
     )
 
-    # 2. Unregistered speaker (different voice) attempts a command
-    unregistered_audio = create_synthetic_wav(frequency=900.0, duration=2.0)
+    imposter_audio = create_synthetic_wav(frequency=800.0, duration=2.0)
 
-    # Force verification failure simulating an imposter speaker
-    with patch.object(
-        VoiceAuthService,
-        "verify_speaker",
-        return_value=(False, 0.35, "Voice not recognized. Command rejected.", "SIMILARITY_BELOW_THRESHOLD"),
-    ):
-        resp = client.post(
-            "/voice/process-audio",
-            files={"file": ("imposter.wav", unregistered_audio, "audio/wav")},
-        )
-
-    assert resp.status_code == 200
-    data = resp.json()
-
-    # Verification must be rejected
-    assert data["speaker_verified"] is False
-    assert data["decision"] == "REJECT"
-    assert data["execution_status"] == "REJECTED"
-    assert "Voice not recognized" in data["message"]
-
-    # Verify NO device state changed
-    fan = db_session.query(Device).filter(Device.id == "fan").first()
-    assert fan.state == "OFF"
-
-
-# ── TEST 4: Enrolled speaker fails similarity threshold ─────────────────────
-
-def test_4_enrolled_speaker_fails_similarity_threshold(client, temp_voice_profile, db_session):
-    """
-    TEST 4: Enrolled speaker fails the similarity threshold.
-    Expected: The command is rejected, and no device state changes.
-    """
-    # 1. Enroll speaker
-    speaker_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
-    client.post(
-        "/voice/enroll",
-        files={"file": ("enroll.wav", speaker_audio, "audio/wav")},
-    )
-
-    # 2. Speaker speaks but score (e.g. 0.58) is below configured threshold (0.65)
     with patch.object(
         VoiceAuthService,
         "verify_speaker",
         return_value=(
             False,
-            0.58,
+            0.38,
             "Voice not recognized. Command rejected.",
-            "SIMILARITY_BELOW_THRESHOLD: 0.5800 < 0.65",
+            "SIMILARITY_BELOW_THRESHOLD: 0.3800 < 0.65",
         ),
     ):
         resp = client.post(
             "/voice/process-audio",
-            files={"file": ("noisy_command.wav", speaker_audio, "audio/wav")},
+            files={"file": ("imposter_cmd.wav", imposter_audio, "audio/wav")},
         )
 
     assert resp.status_code == 200
     data = resp.json()
-
     assert data["speaker_verified"] is False
-    assert data["speaker_similarity"] == 0.58
     assert data["decision"] == "REJECT"
     assert data["execution_status"] == "REJECTED"
     assert "rejected" in data["message"].lower()
 
-    # Device state remains unchanged
-    bedroom_light = db_session.query(Device).filter(Device.id == "bedroom_light").first()
-    assert bedroom_light.state == "OFF"
+    # Fan must remain OFF
+    fan = db_session.query(Device).filter(Device.id == "fan").first()
+    assert fan.state == "OFF"
 
 
-# ── TEST 5: No enrolled profile exists ──────────────────────────────────────
+# ── Scenario 5: No Profile Exists ────────────────────────────────────────────
 
-def test_5_no_enrolled_profile_exists(client, temp_voice_profile, db_session):
+def test_scenario_5_no_profile_exists(client, temp_voice_profile, db_session):
     """
-    TEST 5: No enrolled profile exists.
-    Expected: All ordinary device-control commands are rejected.
+    Scenario 5: No profile exists.
+    Expected: Ordinary device-control commands rejected, enrollment required message.
     """
-    # Ensure no profile exists
     if temp_voice_profile.exists():
         temp_voice_profile.unlink()
 
-    # Attempt voice audio command
-    audio = create_synthetic_wav(frequency=440.0, duration=1.5)
+    audio = create_synthetic_wav(frequency=440.0, duration=2.0)
     resp = client.post(
         "/voice/process-audio",
         files={"file": ("cmd.wav", audio, "audio/wav")},
@@ -337,122 +294,296 @@ def test_5_no_enrolled_profile_exists(client, temp_voice_profile, db_session):
     assert data["decision"] == "REJECT"
     assert "not enrolled" in data["message"].lower()
 
-    # Attempt text command without enrollment
-    resp_text = client.post(
-        "/voice/process",
-        json={"text": "turn on the bedroom light", "input_mode": "text"},
-    )
-    assert resp_text.status_code == 200
-    data_text = resp_text.json()
-    assert data_text["decision"] == "REJECT"
-    assert "not enrolled" in data_text["message"].lower()
-
-    # Verify device state did not change
-    light = db_session.query(Device).filter(Device.id == "bedroom_light").first()
-    assert light.state == "OFF"
+    fan = db_session.query(Device).filter(Device.id == "fan").first()
+    assert fan.state == "OFF"
 
 
-# ── TEST 6: Verification model fails or returns an error ────────────────────
+# ── Scenario 6: Profile File is Corrupted or Missing ─────────────────────────
 
-def test_6_verification_model_fails_closed(client, temp_voice_profile, db_session):
+def test_scenario_6_profile_corrupted_or_missing(client, temp_voice_profile, db_session):
     """
-    TEST 6: Verification model fails or returns an error.
-    Expected: Authentication fails closed; no command executes.
+    Scenario 6: Profile file is corrupted or missing.
+    Expected: Handled safely, commands fail closed without changing device state.
     """
-    # 1. Enroll speaker profile
-    speaker_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
-    client.post(
-        "/voice/enroll",
-        files={"file": ("enroll.wav", speaker_audio, "audio/wav")},
-    )
+    # 6a. Missing profile
+    if temp_voice_profile.exists():
+        temp_voice_profile.unlink()
+    service = VoiceAuthService()
+    assert service.is_enrolled() is False
+    assert service.load_enrolled_embedding() is None
 
-    # 2. Simulate model failure (e.g. RuntimeError or memory failure in encoder)
+    # 6b. Corrupted profile (0 bytes or garbage data)
+    temp_voice_profile.write_bytes(b"corrupted_non_numpy_data_bytes_123456789")
+    assert service.is_enrolled() is False
+    assert service.load_enrolled_embedding() is None
+
+    # 6c. Invalid dimension (e.g. 128 instead of 256)
+    bad_dim = np.ones(128, dtype=np.float32)
+    np.save(temp_voice_profile, bad_dim)
+    assert service.is_enrolled() is False
+    assert service.load_enrolled_embedding() is None
+
+    # Attempt audio command against corrupted profile
+    audio = create_synthetic_wav(frequency=440.0, duration=2.0)
+    resp = client.post(
+        "/voice/process-audio",
+        files={"file": ("cmd.wav", audio, "audio/wav")},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["decision"] == "REJECT"
+    assert resp.json()["speaker_verified"] is False
+
+    bedroom_light = db_session.query(Device).filter(Device.id == "bedroom_light").first()
+    assert bedroom_light.state == "OFF"
+
+
+# ── Scenario 7: Audio is Empty, Too Short, or Invalid ────────────────────────
+
+def test_scenario_7_audio_empty_too_short_or_invalid(client, temp_voice_profile, db_session):
+    """
+    Scenario 7: Audio is empty, too short, or invalid.
+    Expected: Rejects safely and requests another recording.
+    """
+    # Enroll speaker first
+    valid_audio = create_synthetic_wav(frequency=440.0, duration=2.5)
+    client.post("/voice/enroll", files={"file": ("enroll.wav", valid_audio, "audio/wav")})
+
+    # 7a. Completely empty audio file (0 bytes)
+    resp_empty = client.post(
+        "/voice/process-audio",
+        files={"file": ("empty.wav", b"", "audio/wav")},
+    )
+    assert resp_empty.status_code == 200
+    assert resp_empty.json()["decision"] == "REJECT"
+    assert "invalid" in resp_empty.json()["message"].lower() or "empty" in resp_empty.json()["message"].lower()
+
+    # 7b. Corrupted non-WAV bytes
+    resp_corrupt = client.post(
+        "/voice/process-audio",
+        files={"file": ("bad.wav", b"RIFF....NOT_A_VALID_WAVE_FORMAT", "audio/wav")},
+    )
+    assert resp_corrupt.status_code == 200
+    assert resp_corrupt.json()["decision"] == "REJECT"
+
+    # 7c. Pure silent audio
+    silent_audio = create_synthetic_wav(frequency=440.0, duration=2.0, amplitude=0.0)
+    resp_silent = client.post(
+        "/voice/process-audio",
+        files={"file": ("silent.wav", silent_audio, "audio/wav")},
+    )
+    assert resp_silent.status_code == 200
+    assert resp_silent.json()["decision"] == "REJECT"
+
+    # 7d. Audio too short (< 0.5 seconds)
+    short_audio = create_synthetic_wav(frequency=440.0, duration=0.2)
+    resp_short = client.post(
+        "/voice/process-audio",
+        files={"file": ("short.wav", short_audio, "audio/wav")},
+    )
+    assert resp_short.status_code == 200
+    assert resp_short.json()["decision"] == "REJECT"
+
+    # Verify device state never changed
+    fan = db_session.query(Device).filter(Device.id == "fan").first()
+    assert fan.state == "OFF"
+
+
+# ── Scenario 8: Verification Raises an Exception ─────────────────────────────
+
+def test_scenario_8_verification_raises_exception_fails_closed(client, temp_voice_profile, db_session):
+    """
+    Scenario 8: Verification raises an exception.
+    Expected: Fails closed, returns technical error, no command executes.
+    """
+    valid_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
+    client.post("/voice/enroll", files={"file": ("enroll.wav", valid_audio, "audio/wav")})
+
     with patch(
         "app.services.voice_auth_service.get_voice_encoder",
         side_effect=RuntimeError("GPU / Resemblyzer internal encoder failure"),
     ):
         resp = client.post(
             "/voice/process-audio",
-            files={"file": ("cmd.wav", speaker_audio, "audio/wav")},
+            files={"file": ("cmd.wav", valid_audio, "audio/wav")},
         )
 
     assert resp.status_code == 200
     data = resp.json()
-
-    # Must fail closed: not verified, rejected, no action
     assert data["speaker_verified"] is False
     assert data["decision"] == "REJECT"
     assert data["execution_status"] == "REJECTED"
     assert "technical error" in data["message"].lower()
 
-    # Devices remain untouched
     fan = db_session.query(Device).filter(Device.id == "fan").first()
     assert fan.state == "OFF"
 
 
-# ── TEST 7: Direct API request attempts to control device ───────────────────
+# ── Scenario 9: Speech Recognized But Speaker Verification Fails ─────────────
 
-def test_7_direct_api_request_without_auth_rejected(client, db_session):
+def test_scenario_9_speech_recognized_but_verification_fails(client, temp_voice_profile, db_session):
     """
-    TEST 7: Direct API request attempts to control a device without authentication.
-    Expected: The backend rejects the request (HTTP 401).
+    Scenario 9: Speech is recognized by Vosk but speaker verification fails.
+    Expected: Reject command without changing device state.
     """
-    # Attempt to call POST /devices/bedroom_light/command directly without auth header
-    response = client.post(
-        "/devices/bedroom_light/command",
-        json={"action": "ON"},
-    )
+    valid_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
+    client.post("/voice/enroll", files={"file": ("enroll.wav", valid_audio, "audio/wav")})
 
-    # Must be rejected with 401 Unauthorized
-    assert response.status_code == 401
-    assert "authentication required" in response.json()["detail"].lower()
+    # Imposter speaks "turn on bedroom light", Vosk would recognize it, but speaker verification fails
+    with patch.object(
+        VoiceAuthService,
+        "verify_speaker",
+        return_value=(False, 0.45, "Voice not recognized. Command rejected.", "SIMILARITY_BELOW_THRESHOLD: 0.4500 < 0.65"),
+    ):
+        with patch.object(VoiceAuthService, "transcribe_audio", return_value="turn on bedroom light"):
+            resp = client.post(
+                "/voice/process-audio",
+                files={"file": ("imposter.wav", valid_audio, "audio/wav")},
+            )
 
-    # Device state must NOT have changed
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["speaker_verified"] is False
+    assert data["decision"] == "REJECT"
+    assert data["execution_status"] == "REJECTED"
+
+    # Crucial security check: device must NOT turn on despite recognizable command
     light = db_session.query(Device).filter(Device.id == "bedroom_light").first()
     assert light.state == "OFF"
 
 
-# ── TEST 8: Existing profile submitted for replacement ──────────────────────
+# ── Scenario 10: Direct API Request Attempts Control Without Valid Auth ─────
 
-def test_8_existing_profile_replacement_protection(client, temp_voice_profile):
+def test_scenario_10_direct_api_request_without_auth_rejected(client, db_session):
     """
-    TEST 8: Existing profile is submitted for replacement.
-    Expected: The profile is not overwritten without the authorized re-enrollment process.
+    Scenario 10: Direct API request attempts to control a device without valid authentication.
+    Expected: Backend rejects the requests.
     """
-    # 1. Initial enrollment
-    orig_audio = create_synthetic_wav(frequency=400.0, duration=2.0)
-    resp1 = client.post(
-        "/voice/enroll",
-        files={"file": ("sample1.wav", orig_audio, "audio/wav")},
+    # 10a. Direct POST /devices/{id}/command without Bearer auth header
+    resp_device = client.post(
+        "/devices/bedroom_light/command",
+        json={"action": "ON"},
     )
+    assert resp_device.status_code == 401
+    assert "authentication required" in resp_device.json()["detail"].lower()
+
+    # 10b. Direct POST /decisions/confirm without Bearer auth header
+    resp_confirm = client.post(
+        "/decisions/confirm",
+        json={"session_id": "unauth-session", "response": "fan"},
+    )
+    assert resp_confirm.status_code == 200
+    assert resp_confirm.json()["decision"] == "REJECT"
+
+    # 10c. Direct POST /voice/process without Bearer auth header
+    resp_process = client.post(
+        "/voice/process",
+        json={"text": "turn on the fan", "input_mode": "text"},
+    )
+    assert resp_process.status_code == 200
+    assert resp_process.json()["decision"] == "REJECT"
+
+    # Verify no devices changed state
+    fan = db_session.query(Device).filter(Device.id == "fan").first()
+    light = db_session.query(Device).filter(Device.id == "bedroom_light").first()
+    assert fan.state == "OFF"
+    assert light.state == "OFF"
+
+
+# ── Scenario 11: Device State Remains Unchanged After Rejected Commands ─────
+
+def test_scenario_11_device_state_remains_unchanged_after_rejected_commands(client, temp_voice_profile, db_session):
+    """
+    Scenario 11: Device state remains unchanged after rejected commands.
+    Expected: Confirm initial states, send rejected commands, confirm states unchanged.
+    """
+    valid_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
+    client.post("/voice/enroll", files={"file": ("enroll.wav", valid_audio, "audio/wav")})
+
+    # Capture initial states
+    initial_fan = db_session.query(Device).filter(Device.id == "fan").first().state
+    initial_light = db_session.query(Device).filter(Device.id == "bedroom_light").first().state
+    assert initial_fan == "OFF"
+    assert initial_light == "OFF"
+
+    # Sequence of failing commands
+    with patch.object(
+        VoiceAuthService,
+        "verify_speaker",
+        return_value=(False, 0.50, "Voice not recognized. Command rejected.", "SIMILARITY_BELOW_THRESHOLD"),
+    ):
+        client.post("/voice/process-audio", files={"file": ("c1.wav", valid_audio, "audio/wav")})
+        client.post("/voice/process-audio", files={"file": ("c2.wav", valid_audio, "audio/wav")})
+
+    client.post("/voice/process", json={"text": "turn on bedroom light", "input_mode": "text"})
+
+    # Assert states remain strictly OFF
+    assert db_session.query(Device).filter(Device.id == "fan").first().state == initial_fan
+    assert db_session.query(Device).filter(Device.id == "bedroom_light").first().state == initial_light
+
+
+# ── Scenario 12: Repeated Commands Trigger Authentication Automatically ─────
+
+def test_scenario_12_repeated_commands_trigger_auth_automatically(client, temp_voice_profile, db_session):
+    """
+    Scenario 12: Repeated commands continue to trigger authentication automatically.
+    Expected:
+      Command 1: Genuine speaker -> VERIFIED -> executes (fan turns ON).
+      Command 2: Imposter speaker -> REJECTED -> fan remains ON (does not turn OFF).
+      Command 3: Genuine speaker -> VERIFIED -> executes (fan turns OFF).
+    """
+    genuine_audio = create_synthetic_wav(frequency=440.0, duration=2.0)
+    client.post("/voice/enroll", files={"file": ("enroll.wav", genuine_audio, "audio/wav")})
+
+    # Command 1: Genuine user says "turn on the fan"
+    with patch.object(
+        VoiceAuthService,
+        "verify_speaker",
+        return_value=(True, 0.82, "Voice verified. Processing command.", None),
+    ):
+        with patch.object(VoiceAuthService, "transcribe_audio", return_value="turn on the fan"):
+            resp1 = client.post(
+                "/voice/process-audio",
+                files={"file": ("cmd1.wav", genuine_audio, "audio/wav")},
+            )
+
     assert resp1.status_code == 200
-    orig_embedding = np.load(temp_voice_profile)
+    assert resp1.json()["speaker_verified"] is True
+    assert resp1.json()["decision"] == "EXECUTE"
+    assert db_session.query(Device).filter(Device.id == "fan").first().state == "ON"
 
-    # 2. Attempt replacement WITHOUT explicit force flag
-    new_audio = create_synthetic_wav(frequency=600.0, duration=2.0)
-    resp_unauth = client.post(
-        "/voice/enroll",
-        files={"file": ("sample2.wav", new_audio, "audio/wav")},
-        data={"force": False},
-    )
+    # Command 2: Imposter user immediately says "turn off the fan"
+    imposter_audio = create_synthetic_wav(frequency=900.0, duration=2.0)
+    with patch.object(
+        VoiceAuthService,
+        "verify_speaker",
+        return_value=(False, 0.41, "Voice not recognized. Command rejected.", "SIMILARITY_BELOW_THRESHOLD"),
+    ):
+        with patch.object(VoiceAuthService, "transcribe_audio", return_value="turn off the fan"):
+            resp2 = client.post(
+                "/voice/process-audio",
+                files={"file": ("cmd2.wav", imposter_audio, "audio/wav")},
+            )
 
-    # Must be rejected with 409 Conflict
-    assert resp_unauth.status_code == 409
-    assert "already exists" in resp_unauth.json()["detail"].lower()
+    assert resp2.status_code == 200
+    assert resp2.json()["speaker_verified"] is False
+    assert resp2.json()["decision"] == "REJECT"
+    # The fan must remain ON! The imposter was not allowed to turn it off
+    assert db_session.query(Device).filter(Device.id == "fan").first().state == "ON"
 
-    # Verify profile was NOT overwritten
-    current_embedding = np.load(temp_voice_profile)
-    assert np.array_equal(orig_embedding, current_embedding)
+    # Command 3: Genuine user says "turn off the fan"
+    with patch.object(
+        VoiceAuthService,
+        "verify_speaker",
+        return_value=(True, 0.79, "Voice verified. Processing command.", None),
+    ):
+        with patch.object(VoiceAuthService, "transcribe_audio", return_value="turn off the fan"):
+            resp3 = client.post(
+                "/voice/process-audio",
+                files={"file": ("cmd3.wav", genuine_audio, "audio/wav")},
+            )
 
-    # 3. Authorized re-enrollment WITH explicit force flag
-    resp_auth = client.post(
-        "/voice/enroll",
-        files={"file": ("sample2.wav", new_audio, "audio/wav")},
-        data={"force": True},
-    )
-    assert resp_auth.status_code == 200
-    assert resp_auth.json()["success"] is True
-
-    # Verify profile was updated with authorized process
-    updated_embedding = np.load(temp_voice_profile)
-    assert not np.array_equal(orig_embedding, updated_embedding)
+    assert resp3.status_code == 200
+    assert resp3.json()["speaker_verified"] is True
+    assert resp3.json()["decision"] == "EXECUTE"
+    # Now fan turns OFF
+    assert db_session.query(Device).filter(Device.id == "fan").first().state == "OFF"

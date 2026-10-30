@@ -140,14 +140,14 @@ export default function VoiceAssistant() {
 
     try {
       setEnrollState('recording');
-      setEnrollMessage('Recording voice sample... Please speak clearly for 3 seconds');
-      setEnrollCountdown(3);
+      setEnrollMessage('Recording voice sample... Please speak clearly for 4 seconds');
+      setEnrollCountdown(4);
 
       const recorder = new AudioRecorder();
       enrollRecorderRef.current = recorder;
       await recorder.start();
 
-      let timeLeft = 3;
+      let timeLeft = 4;
       countdownIntervalRef.current = setInterval(async () => {
         timeLeft -= 1;
         setEnrollCountdown(timeLeft);

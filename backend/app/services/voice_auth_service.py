@@ -73,9 +73,11 @@ class VoiceAuthService:
     # ── Profile Management ──────────────────────────────────────────────────
 
     def is_enrolled(self) -> bool:
-        """Check whether an enrolled voice profile exists and is non-empty."""
+        """Check whether an enrolled voice profile exists, is non-empty, and can be loaded."""
         path = settings.get_enrolled_voice_path()
-        return path.is_file() and path.stat().st_size > 0
+        if not path.is_file() or path.stat().st_size == 0:
+            return False
+        return self.load_enrolled_embedding() is not None
 
     def get_enrolled_path(self) -> Path:
         """Return the path to the enrolled voice profile file."""
@@ -83,18 +85,22 @@ class VoiceAuthService:
 
     def load_enrolled_embedding(self) -> np.ndarray | None:
         """Load and return the enrolled speaker embedding vector."""
-        if not self.is_enrolled():
+        path = self.get_enrolled_path()
+        if not path.is_file() or path.stat().st_size == 0:
             return None
         try:
-            path = self.get_enrolled_path()
             embedding = np.load(path)
             if embedding.ndim != 1 or embedding.shape[0] != 256:
                 logger.warning("Enrolled embedding has invalid shape %s", embedding.shape)
                 return None
+            if np.isnan(embedding).any() or np.isinf(embedding).any():
+                logger.warning("Enrolled embedding contains NaN or Inf values")
+                return None
             norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
-            return embedding
+            if norm == 0 or np.isnan(norm) or np.isinf(norm):
+                logger.warning("Enrolled embedding has zero or invalid norm")
+                return None
+            return (embedding / norm).astype(np.float32)
         except Exception as err:
             logger.error("Failed to load enrolled embedding: %s", err)
             return None
@@ -106,7 +112,7 @@ class VoiceAuthService:
             path.parent.mkdir(parents=True, exist_ok=True)
             norm = np.linalg.norm(embedding)
             if norm > 0:
-                embedding = embedding / norm
+                embedding = (embedding / norm).astype(np.float32)
 
             # Atomic write via temp file in the same directory
             temp_file = tempfile.NamedTemporaryFile(
@@ -141,7 +147,7 @@ class VoiceAuthService:
         Raises ValueError or RuntimeError on invalid or unreadable audio.
         """
         if not audio_bytes or len(audio_bytes) < 44:
-            raise ValueError("Audio data is empty or too short.")
+            raise ValueError("Audio recording is empty or too short.")
 
         buf = io.BytesIO(audio_bytes)
         try:
@@ -153,6 +159,8 @@ class VoiceAuthService:
                 temp_wav_path = tf.name
             try:
                 data, sr = sf.read(temp_wav_path, dtype="float32")
+            except Exception as read_err:
+                raise ValueError(f"Corrupted or invalid audio file format: {read_err}")
             finally:
                 Path(temp_wav_path).unlink(missing_ok=True)
 
@@ -161,18 +169,19 @@ class VoiceAuthService:
 
         return data, sr
 
-    def preprocess_audio(self, audio_bytes: bytes) -> np.ndarray:
+    def preprocess_audio(self, audio_bytes: bytes, min_voiced_samples: int = 8000) -> np.ndarray:
         """
         Decode audio and apply Resemblyzer's VAD silence trimming and resampling.
-        Falls back to direct resampling if VAD trims excessively but energy is present.
+        Validates energy, length, and speech presence.
         """
         from resemblyzer import preprocess_wav
 
         data, sr = self.decode_audio_bytes(audio_bytes)
 
-        # Basic energy check: reject pure digital silence
+        # Basic energy check: reject pure digital silence or inaudible recordings
+        rms = float(np.sqrt(np.mean(data ** 2))) if len(data) > 0 else 0.0
         max_amp = float(np.max(np.abs(data))) if len(data) > 0 else 0.0
-        if max_amp < 0.005:
+        if max_amp < 0.005 or rms < 0.001:
             raise ValueError("Audio sample is silent or has too little energy.")
 
         try:
@@ -181,8 +190,8 @@ class VoiceAuthService:
             waveform = np.array([], dtype=np.float32)
 
         # If VAD trimmed too much or failed, fallback to resampled raw audio if long enough
-        if len(waveform) < 1600:
-            if len(data) >= 1600:
+        if len(waveform) < min_voiced_samples:
+            if len(data) >= min_voiced_samples:
                 import librosa
                 if sr != 16000:
                     waveform = librosa.resample(data, orig_sr=sr, target_sr=16000)
@@ -193,7 +202,9 @@ class VoiceAuthService:
                 if peak > 0:
                     waveform = waveform / peak * 0.9
             else:
-                raise ValueError("No recognizable speech detected in audio sample.")
+                raise ValueError(
+                    "Audio is too short or inaudible. Please speak clearly for at least 1-2 seconds."
+                )
 
         return waveform
 
@@ -209,7 +220,8 @@ class VoiceAuthService:
 
         Security:
           - Does not overwrite an existing profile unless force=True.
-          - Confirms enrollment only after successful creation and disk save.
+          - Confirms enrollment only after successful creation, disk save,
+            and verification by reloading the profile from disk.
         """
         if self.is_enrolled() and not force:
             return (
@@ -219,7 +231,8 @@ class VoiceAuthService:
             )
 
         try:
-            waveform = self.preprocess_audio(audio_bytes)
+            # Enforce at least 1.25s (~20,000 samples) of speech for a stable enrollment embedding
+            waveform = self.preprocess_audio(audio_bytes, min_voiced_samples=20000)
         except ValueError as val_err:
             return (
                 False,
@@ -243,6 +256,16 @@ class VoiceAuthService:
                     False,
                     "Failed to save voice profile to disk.",
                     {"error_code": "SAVE_FAILED", "is_enrolled": self.is_enrolled()},
+                )
+
+            # Confirm enrollment ONLY after verifying profile can be loaded and is valid
+            reloaded = self.load_enrolled_embedding()
+            if reloaded is None or reloaded.shape != (256,):
+                self.delete_profile()
+                return (
+                    False,
+                    "Voice profile verification failed after saving. Profile was not confirmed.",
+                    {"error_code": "SAVE_FAILED", "is_enrolled": False},
                 )
 
             return (
@@ -298,12 +321,13 @@ class VoiceAuthService:
             )
 
         try:
-            waveform = self.preprocess_audio(audio_bytes)
+            # For commands, require at least 0.5s (~8,000 samples) of voiced speech
+            waveform = self.preprocess_audio(audio_bytes, min_voiced_samples=8000)
         except ValueError as val_err:
             return (
                 False,
                 0.0,
-                "Audio recording is empty or invalid.",
+                f"Audio recording is invalid: {val_err}",
                 f"INVALID_AUDIO: {val_err}",
             )
         except Exception as err:
@@ -321,7 +345,7 @@ class VoiceAuthService:
 
             norm_cmd = np.linalg.norm(command_embedding)
             norm_enr = np.linalg.norm(enrolled_embedding)
-            if norm_cmd == 0 or norm_enr == 0:
+            if norm_cmd == 0 or norm_enr == 0 or np.isnan(norm_cmd) or np.isnan(norm_enr):
                 return (
                     False,
                     0.0,
