@@ -110,6 +110,7 @@ app.add_middleware(
 )
 
 # ── Register routers ─────────────────────────────────────────────────────────
+# Mount directly for internal routes & tests
 app.include_router(voice_router.router)
 app.include_router(devices_router.router)
 app.include_router(decisions_router.router)
@@ -117,6 +118,19 @@ app.include_router(activity_router.router)
 app.include_router(emergency_router.router)
 app.include_router(evaluation_router.router)
 app.include_router(system_router.router)
+
+# Mount also under /api prefix for direct API callers
+api_router_list = [
+    voice_router.router,
+    devices_router.router,
+    decisions_router.router,
+    activity_router.router,
+    emergency_router.router,
+    evaluation_router.router,
+    system_router.router,
+]
+for r in api_router_list:
+    app.include_router(r, prefix="/api")
 
 
 @app.get("/", tags=["root"])

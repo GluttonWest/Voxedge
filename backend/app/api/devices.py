@@ -2,7 +2,9 @@
 
 import json
 
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy.orm import Session
 
 from app.database.session import get_db
@@ -13,8 +15,10 @@ from app.schemas.device import (
     DeviceStateUpdate,
 )
 from app.services.device_service import DeviceService
+from app.services.voice_auth_service import VoiceAuthService
 
 router = APIRouter(prefix="/devices", tags=["devices"])
+_voice_auth_service = VoiceAuthService()
 
 
 def _device_to_response(device) -> DeviceResponse:
@@ -54,15 +58,27 @@ def get_device(device_id: str, db: Session = Depends(get_db)):
 def command_device(
     device_id: str,
     body: DeviceCommandRequest,
+    authorization: Annotated[str | None, Header()] = None,
     db: Session = Depends(get_db),
 ):
     """
-    Send a command to a device.
+    Send a direct command to a device.
 
-    This goes through backend validation (supported action check,
-    state validation). In the full pipeline, voice commands also
-    pass through the decision engine before reaching this layer.
+    Security requirement (TEST 7):
+      Direct API requests attempting to control a device without authentication
+      must be rejected with HTTP 401 Unauthorized.
     """
+    token = None
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.split("Bearer ", 1)[1].strip()
+
+    valid, _ = _voice_auth_service.verify_session_token(token) if token else (False, None)
+    if not valid:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required: Direct device control without authentication is forbidden.",
+        )
+
     service = DeviceService(db)
     result = service.execute_action(device_id, body.action)
     if not result["success"]:

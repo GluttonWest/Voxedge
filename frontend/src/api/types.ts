@@ -16,6 +16,37 @@ export interface DeviceListResponse {
   count: number;
 }
 
+export interface EnrollmentStatus {
+  is_enrolled: boolean;
+  similarity_threshold: number;
+  message: string;
+}
+
+export interface VoiceEnrollResponse {
+  success: boolean;
+  is_enrolled: boolean;
+  message: string;
+  dimensions?: number;
+  similarity_threshold?: number;
+}
+
+export interface StructuredIntent {
+  raw_text: string;
+  intent: string;
+  device?: string | null;
+  device_type?: string | null;
+  location?: string | null;
+  action?: string | null;
+  is_ambiguous: boolean;
+  requires_clarification: boolean;
+  clarification_prompt?: string | null;
+  confidence: number;
+  reason: string;
+  is_indirect: boolean;
+  suggested_action?: string | null;
+  suggested_device?: string | null;
+}
+
 export interface VoiceProcessRequest {
   text: string;
   input_mode?: string;
@@ -29,6 +60,10 @@ export interface VoiceProcessResponse {
   intent: string | null;
   intent_confidence: number | null;
   entities: Record<string, unknown>;
+  structured_intent?: StructuredIntent | null;
+  slm_proposal?: Record<string, unknown> | null;
+  is_ambiguous?: boolean;
+  requires_clarification?: boolean;
   decision: string;
   decision_reason: string;
   target_device: string | null;
@@ -38,6 +73,10 @@ export interface VoiceProcessResponse {
   clarification_question: string | null;
   requires_confirmation: boolean;
   message: string;
+  speaker_verified?: boolean | null;
+  speaker_similarity?: number | null;
+  similarity_threshold?: number | null;
+  auth_token?: string | null;
 }
 
 export interface ConfirmationRequest {
@@ -109,4 +148,40 @@ export interface SystemStatus {
   active_emergencies: number;
   uptime_seconds: number;
   timestamp: string;
+}
+
+export interface ConversationTurn {
+  id: number;
+  session_id: string;
+  timestamp: string;
+  user_text?: string | null;
+  assistant_response?: string | null;
+  intent?: string | null;
+  device_id?: string | null;
+  action?: string | null;
+  decision_outcome?: string | null;
+  execution_status?: string | null;
+  is_clarification: boolean;
+  clarification_question?: string | null;
+  clarification_answer?: string | null;
+  is_follow_up: boolean;
+}
+
+export interface ConversationHistoryResponse {
+  session_id: string;
+  total_turns: number;
+  max_limit: number;
+  turns: ConversationTurn[];
+}
+
+export interface ContextSummaryResponse {
+  session_id: string;
+  last_device?: string | null;
+  last_device_type?: string | null;
+  last_action?: string | null;
+  last_command?: string | null;
+  has_pending_clarification: boolean;
+  pending_clarification_question?: string | null;
+  pending_action?: string | null;
+  current_device_states: Record<string, string>;
 }

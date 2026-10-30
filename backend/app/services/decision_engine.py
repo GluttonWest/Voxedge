@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.services.context_service import ContextService, PendingClarification
 from app.services.device_service import DeviceService
+from app.services.slm_service import SLMService
 from app.services.intent_service import (
     CANCEL,
     CONFIRM,
@@ -61,6 +62,7 @@ class Decision:
     requires_confirmation: bool = False
     message: str = ""
     entities: dict = field(default_factory=dict)
+    slm_proposal: dict | None = None
 
 
 class DecisionEngine:
@@ -79,6 +81,7 @@ class DecisionEngine:
         self.device_service = DeviceService(db)
         self.context = context
         self.db = db
+        self.slm_service = SLMService()
 
     def decide(
         self,
@@ -87,7 +90,89 @@ class DecisionEngine:
     ) -> Decision:
         """
         Main entry point: route the intent to the appropriate handler.
+        First checks if the utterance answers an active clarification question.
         """
+        # ── Priority 0: Multi-turn Clarification Answering ──────────────────
+        # Only evaluate if the input is not a direct command or indirect statement
+        pending = self.context.get_pending(session_id)
+        if pending is not None and not (intent_result.is_indirect or intent_result.entities.get("is_indirect")):
+            # Emergency always supersedes pending clarification
+            if intent_result.intent == EMERGENCY:
+                self.context.clear_pending(session_id)
+                return self._handle_emergency(intent_result)
+
+            clarify_status, resolution_data, explanation = (
+                self.context.resolve_clarification_response(
+                    session_id=session_id,
+                    text=intent_result.raw_text,
+                    db_session=self.db,
+                )
+            )
+
+            if clarify_status == "RESOLVED" and resolution_data:
+                target_dev = resolution_data["device"]
+                target_act = resolution_data["action"]
+                dev_obj = self.device_service.get_device(target_dev)
+                if dev_obj:
+                    try:
+                        supported = json.loads(dev_obj.supported_actions)
+                    except Exception:
+                        supported = ["ON", "OFF"]
+
+                    if target_act.upper() in supported:
+                        return Decision(
+                            outcome=EXECUTE,
+                            intent=CONTROL_DEVICE,
+                            target_device=target_dev,
+                            requested_action=target_act.upper(),
+                            confidence=0.95,
+                            reason=f"Multi-turn clarification resolved: {explanation}",
+                            message=f"Understood. Turning {target_act.upper()} the {dev_obj.name}.",
+                            entities={
+                                "device": target_dev,
+                                "action": target_act.upper(),
+                                "resolved_from_clarification": True,
+                                "parent_interaction_id": resolution_data.get("parent_interaction_id"),
+                            },
+                        )
+                    else:
+                        return Decision(
+                            outcome=REJECT,
+                            intent=CONTROL_DEVICE,
+                            target_device=target_dev,
+                            requested_action=target_act,
+                            reason=f"Action '{target_act}' is not supported for {dev_obj.name}.",
+                            message=f"The {dev_obj.name} doesn't support '{target_act}'.",
+                            entities={"device": target_dev, "action": target_act},
+                        )
+
+            elif clarify_status == "CANCELED":
+                return Decision(
+                    outcome=REJECT,
+                    intent=CANCEL,
+                    confidence=0.9,
+                    reason="User canceled pending clarification.",
+                    message="Okay, canceled.",
+                    entities=intent_result.entities,
+                )
+
+            elif clarify_status == "UNCLEAR":
+                prompt = pending.question if pending else "Please clarify which device you mean."
+                return Decision(
+                    outcome=CLARIFY,
+                    intent=CONTROL_DEVICE,
+                    confidence=0.4,
+                    reason=f"Clarification answer was unclear: {explanation}",
+                    clarification_question=prompt,
+                    message=f"I didn't quite catch which device you meant. {prompt}",
+                    entities=intent_result.entities,
+                )
+
+            elif clarify_status == "UNRELATED":
+                # User changed topic or asked an unrelated command.
+                # Clear pending clarification and proceed to process the new command naturally below!
+                self.context.clear_pending(session_id)
+
         intent = intent_result.intent
 
         if intent == EMERGENCY:
@@ -241,134 +326,156 @@ class DecisionEngine:
 
     def _handle_control(self, ir: IntentResult, session_id: str) -> Decision:
         """
-        Handle CONTROL_DEVICE intent — the most complex path.
-
-        Checks:
-          1. Is the action specified?
-          2. Is the device specified and unambiguous?
-          3. If ambiguous, can context resolve it?
-          4. Is the action supported on this device?
+        Handle CONTROL_DEVICE intent — including direct commands, indirect
+        natural-language requests, pronoun disambiguation, and unsupported actions.
         """
+        # ── 1. Indirect natural language statements ───────────────────────
+        if ir.is_indirect or ir.entities.get("is_indirect"):
+            return self._handle_indirect_statement(ir, session_id)
+
         action = ir.entities.get("action")
         device_id = ir.entities.get("device")
         device_type = ir.entities.get("device_type")
-        is_ambiguous = ir.entities.get("device_ambiguous", False)
+        is_ambiguous = ir.is_ambiguous or ir.entities.get("device_ambiguous", False)
         has_pronoun = ir.entities.get("pronoun_reference", False)
         action_missing = ir.entities.get("action_missing", False)
+        unknown_device = ir.entities.get("unknown_device", False)
 
-        # ── Missing action ────────────────────────────────────────────────
+        # ── 2. Unknown device check (e.g. "turn on the TV") ───────────────
+        if unknown_device or (device_id and device_id not in ("fan", "bedroom_light", "living_room_light", "light", "lights", "lamp")):
+            # Check if device exists in DB
+            db_dev = self.device_service.get_device(device_id) if device_id else None
+            if db_dev is None:
+                dev_name = device_id or "requested device"
+                all_devices = self.device_service.list_devices()
+                known_names = ", ".join(d.name for d in all_devices)
+                return Decision(
+                    outcome=REJECT,
+                    intent=CONTROL_DEVICE,
+                    target_device=device_id,
+                    requested_action=action,
+                    confidence=ir.confidence,
+                    reason=f"Device '{dev_name}' does not exist or is not supported.",
+                    message=f"I don't have a registered device called '{dev_name}'. I can control: {known_names}.",
+                    entities=ir.entities,
+                )
+
+        # ── 3. Missing action ─────────────────────────────────────────────
         if action is None or action_missing:
-            if device_id:
+            if device_id and device_id in ("fan", "bedroom_light", "living_room_light"):
+                db_dev = self.device_service.get_device(device_id)
+                dev_name = db_dev.name if db_dev else device_id
+                prompt = f"What would you like to do with the {dev_name}? Turn it on or off?"
                 return Decision(
                     outcome=CLARIFY,
                     intent=CONTROL_DEVICE,
                     target_device=device_id,
                     confidence=ir.confidence,
-                    reason="Action not specified.",
-                    clarification_question=f"What would you like to do with the {device_id}? Turn it on or off?",
-                    message="I understood the device but not the action. What should I do with it?",
+                    reason="Target device identified but requested action is missing.",
+                    clarification_question=prompt,
+                    message=prompt,
                     entities=ir.entities,
                 )
+            prompt = "I didn't catch that clearly. Could you say something like 'turn on the fan' or 'turn off the bedroom light'?"
             return Decision(
                 outcome=CLARIFY,
                 intent=CONTROL_DEVICE,
                 confidence=ir.confidence,
                 reason="Neither device nor action are clear.",
-                clarification_question="I didn't catch that clearly. Could you say something like 'turn on the bedroom light'?",
-                message="Could you repeat that more clearly?",
+                clarification_question=prompt,
+                message=prompt,
                 entities=ir.entities,
             )
 
-        # ── Pronoun resolution ("turn it off") ───────────────────────────
-        if has_pronoun and device_id is None:
-            resolved = self.context.get_last_device(session_id)
-            if resolved:
-                device_id = resolved
-                ir.entities["device"] = resolved
+        # ── 4. Pronoun resolution without device ("turn it off", "switch that on")
+        if has_pronoun and (device_id is None or device_id in ("it", "that", "this")):
+            resolved_dev, reason = self.context.resolve_pronoun(session_id, action, self.db)
+            if resolved_dev:
+                device_id = resolved_dev
+                ir.entities["device"] = resolved_dev
                 ir.entities["resolved_from_context"] = True
             else:
+                act_str = action.lower() if action else "adjust"
+                prompt = f"Which device would you like me to turn {act_str}: the fan or the lights?"
+                self.context.set_pending(
+                    session_id,
+                    PendingClarification(
+                        interaction_id=None,
+                        question=prompt,
+                        intent=CONTROL_DEVICE,
+                        action=action,
+                        needed_slot="device",
+                        candidates=["fan", "bedroom_light", "living_room_light"],
+                    ),
+                )
                 return Decision(
                     outcome=CLARIFY,
                     intent=CONTROL_DEVICE,
                     requested_action=action,
                     confidence=ir.confidence,
-                    reason="Pronoun reference but no recent device in context.",
-                    clarification_question="Which device do you mean? I don't have a recent reference.",
-                    message="Which device are you referring to?",
+                    reason=f"Ambiguous pronoun reference: {reason}",
+                    clarification_question=prompt,
+                    message=prompt,
                     entities=ir.entities,
                 )
 
-        # ── Ambiguous device ("turn off the light" — which light?) ────────
-        if is_ambiguous and device_id is None:
-            # Try to narrow via device_type
-            candidates = self.device_service.get_device_by_name_or_location(
-                device_type=device_type
-            )
+        # ── 5. Generic or Ambiguous lights ("turn off the lights", "switch on the light")
+        if (is_ambiguous and device_id in ("light", "lights", "the lights", "the light", None)) or device_id in ("lights", "light", "the lights", "the light"):
+            candidates = self.device_service.get_device_by_name_or_location(device_type="light")
+            candidate_names = [c.name for c in candidates]
+            candidate_ids = [c.id for c in candidates]
 
-            if len(candidates) == 1:
-                device_id = candidates[0].id
+            # If context was established, resolve
+            last_device = self.context.get_last_device(session_id)
+            if last_device and last_device in candidate_ids:
+                device_id = last_device
                 ir.entities["device"] = device_id
-                ir.entities["resolved_from_type"] = True
-            elif len(candidates) > 1:
-                candidate_names = [c.name for c in candidates]
-                candidate_ids = [c.id for c in candidates]
-
-                # Try context to disambiguate
-                last_device = self.context.get_last_device(session_id)
-                if last_device and last_device in candidate_ids:
-                    device_id = last_device
-                    ir.entities["device"] = device_id
-                    ir.entities["resolved_from_context"] = True
-                else:
-                    # Must ask the user
-                    self.context.set_pending(
-                        session_id,
-                        PendingClarification(
-                            interaction_id=0,  # will be updated by caller
-                            question=f"Which one do you mean: {', '.join(candidate_names)}?",
-                            intent=CONTROL_DEVICE,
-                            entities=ir.entities,
-                            candidates=candidate_ids,
-                            action=action,
-                        ),
-                    )
-                    return Decision(
-                        outcome=CLARIFY,
-                        intent=CONTROL_DEVICE,
-                        requested_action=action,
-                        confidence=ir.confidence,
-                        reason=f"Multiple {device_type} devices found.",
-                        clarification_question=f"Which one do you mean: {', '.join(candidate_names)}?",
-                        message=f"There are multiple {device_type}s. Which one?",
-                        entities=ir.entities,
-                    )
+                ir.entities["resolved_from_context"] = True
             else:
+                act_str = action.lower() if action else "adjust"
+                prompt = f"Which light would you like me to turn {act_str}: the Bedroom Light or the Living Room Light?"
+                self.context.set_pending(
+                    session_id,
+                    PendingClarification(
+                        interaction_id=None,
+                        question=prompt,
+                        intent=CONTROL_DEVICE,
+                        action=action,
+                        needed_slot="device",
+                        candidates=candidate_ids,
+                    ),
+                )
                 return Decision(
-                    outcome=REJECT,
+                    outcome=CLARIFY,
                     intent=CONTROL_DEVICE,
                     requested_action=action,
                     confidence=ir.confidence,
-                    reason=f"No active {device_type} devices found.",
-                    message=f"I don't have any {device_type} devices registered.",
+                    reason=f"Ambiguous light command: multiple light devices exist ({', '.join(candidate_names)}).",
+                    clarification_question=prompt,
+                    message=prompt,
                     entities=ir.entities,
                 )
 
-        # ── Missing device entirely ───────────────────────────────────────
+        # ── 6. Missing device entirely ────────────────────────────────────
         if device_id is None:
+            act_str = action.lower() if action else "adjust"
+            prompt = f"Which device would you like me to turn {act_str}: the fan or the lights?"
             return Decision(
                 outcome=CLARIFY,
                 intent=CONTROL_DEVICE,
                 requested_action=action,
                 confidence=ir.confidence,
-                reason="No device specified and no context to resolve from.",
-                clarification_question="Which device should I turn " + action.lower() + "?",
-                message="Which device do you mean?",
+                reason="No device specified in the command.",
+                clarification_question=prompt,
+                message=prompt,
                 entities=ir.entities,
             )
 
-        # ── Validate device exists ────────────────────────────────────────
+        # ── 7. Validate device exists ─────────────────────────────────────
         device = self.device_service.get_device(device_id)
         if device is None:
+            all_devices = self.device_service.list_devices()
+            known_names = ", ".join(d.name for d in all_devices)
             return Decision(
                 outcome=REJECT,
                 intent=CONTROL_DEVICE,
@@ -376,7 +483,7 @@ class DecisionEngine:
                 requested_action=action,
                 confidence=ir.confidence,
                 reason=f"Device '{device_id}' does not exist.",
-                message=f"I don't know a device called '{device_id}'.",
+                message=f"I don't know a device called '{device_id}'. I can control: {known_names}.",
                 entities=ir.entities,
             )
 
@@ -392,7 +499,7 @@ class DecisionEngine:
                 entities=ir.entities,
             )
 
-        # ── Validate action is supported ──────────────────────────────────
+        # ── 8. Validate action is supported ───────────────────────────────
         supported = json.loads(device.supported_actions)
         if action.upper() not in supported:
             return Decision(
@@ -401,24 +508,14 @@ class DecisionEngine:
                 target_device=device_id,
                 requested_action=action,
                 confidence=ir.confidence,
-                reason=f"Action '{action}' is not supported for {device.name}.",
-                message=f"The {device.name} doesn't support '{action}'. Supported: {', '.join(supported)}.",
+                reason=f"Action '{action}' is not supported for {device.name}. Supported: {supported}.",
+                message=f"The {device.name} doesn't support '{action}'. Supported actions: {', '.join(supported)}.",
                 entities=ir.entities,
             )
 
-        # ── Low confidence → ask for confirmation ─────────────────────────
+        # ── 9. Low confidence confirmation check ──────────────────────────
         if ir.confidence < settings.intent_confidence_threshold:
-            self.context.set_pending(
-                session_id,
-                PendingClarification(
-                    interaction_id=0,
-                    question=f"Did you mean: turn {action} the {device.name}?",
-                    intent=CONTROL_DEVICE,
-                    entities=ir.entities,
-                    candidates=[device_id],
-                    action=action,
-                ),
-            )
+            prompt = f"Did you mean: turn {action} the {device.name}?"
             return Decision(
                 outcome=CLARIFY,
                 intent=CONTROL_DEVICE,
@@ -427,20 +524,170 @@ class DecisionEngine:
                 confidence=ir.confidence,
                 requires_confirmation=True,
                 reason=f"Low confidence ({ir.confidence:.2f} < {settings.intent_confidence_threshold}).",
-                clarification_question=f"Did you mean: turn {action} the {device.name}?",
+                clarification_question=prompt,
                 message="I'm not fully sure I understood. Can you confirm?",
                 entities=ir.entities,
             )
 
-        # ── All checks passed → EXECUTE ───────────────────────────────────
+        # ── 10. Clear, validated command → EXECUTE ────────────────────────
         return Decision(
             outcome=EXECUTE,
             intent=CONTROL_DEVICE,
             target_device=device_id,
-            requested_action=action,
+            requested_action=action.upper(),
             confidence=ir.confidence,
-            reason="Valid command with sufficient confidence.",
-            message=f"Turning {action} the {device.name}.",
+            reason=f"Valid command with identified device '{device.name}' and action '{action.upper()}'.",
+            message=f"Turning {action.upper()} the {device.name}.",
+            entities=ir.entities,
+        )
+
+    def _handle_indirect_statement(self, ir: IntentResult, session_id: str) -> Decision:
+        """
+        Handle indirect natural-language statements by inspecting current
+        simulated device capabilities and states, and clarifying rather than guessing.
+        """
+        text = ir.raw_text.lower()
+
+        # 1. Darkness ("It's too dark", "Can't see", etc.)
+        if "dark" in text or "see" in text or "light" in text:
+            lights = self.device_service.get_device_by_name_or_location(device_type="light")
+            off_lights = [l for l in lights if l.state == "OFF"]
+            if len(off_lights) == 1:
+                target_light = off_lights[0]
+                prompt = f"It sounds like it's too dark. Would you like me to turn on the {target_light.name}?"
+            else:
+                prompt = "It sounds like it's too dark. Which light would you like me to turn on: the Bedroom Light or the Living Room Light?"
+
+            self.context.set_pending(
+                session_id,
+                PendingClarification(
+                    interaction_id=None,
+                    question=prompt,
+                    intent=CONTROL_DEVICE,
+                    action="ON",
+                    needed_slot="device",
+                    candidates=["bedroom_light", "living_room_light"],
+                ),
+            )
+            return Decision(
+                outcome=CLARIFY,
+                intent=CONTROL_DEVICE,
+                requested_action="ON",
+                confidence=ir.confidence,
+                reason="Indirect statement expressing darkness. Checked light capabilities and suggested turning on lights.",
+                clarification_question=prompt,
+                message=prompt,
+                entities=ir.entities,
+            )
+
+        # 2. Brightness ("It's too bright", "Blinding")
+        if "bright" in text or "blinding" in text or "eyes" in text:
+            prompt = "The lights do not support dimming. Would you like me to turn off the Bedroom Light or the Living Room Light?"
+            self.context.set_pending(
+                session_id,
+                PendingClarification(
+                    interaction_id=None,
+                    question=prompt,
+                    intent=CONTROL_DEVICE,
+                    action="OFF",
+                    needed_slot="device",
+                    candidates=["bedroom_light", "living_room_light"],
+                ),
+            )
+            return Decision(
+                outcome=CLARIFY,
+                intent=CONTROL_DEVICE,
+                requested_action="OFF",
+                confidence=ir.confidence,
+                reason="Indirect statement expressing excess brightness. Dimming is unsupported; clarifying whether to turn off lights.",
+                clarification_question=prompt,
+                message=prompt,
+                entities=ir.entities,
+            )
+
+        # 3. Heat ("I'm feeling hot", "It's too hot", "Stuffy")
+        if "hot" in text or "warm" in text or "stuffy" in text or "sweating" in text:
+            fan = self.device_service.get_device("fan")
+            if fan and fan.state == "ON":
+                prompt = "The fan is already ON. Would you like me to do something else?"
+            else:
+                prompt = "You mentioned you're feeling hot. Would you like me to turn on the fan?"
+
+            self.context.set_pending(
+                session_id,
+                PendingClarification(
+                    interaction_id=None,
+                    question=prompt,
+                    intent=CONTROL_DEVICE,
+                    device_id="fan",
+                    action="ON",
+                    needed_slot="action",
+                    candidates=["fan"],
+                ),
+            )
+            return Decision(
+                outcome=CLARIFY,
+                intent=CONTROL_DEVICE,
+                target_device="fan",
+                requested_action="ON",
+                confidence=ir.confidence,
+                reason="Indirect statement expressing heat. Interpreted cautiously to clarify whether to turn on the fan.",
+                clarification_question=prompt,
+                message=prompt,
+                entities=ir.entities,
+            )
+
+        # 4. Cold ("It's too cold", "I'm feeling cold", "Chilly")
+        if "cold" in text or "chilly" in text or "freezing" in text:
+            fan = self.device_service.get_device("fan")
+            if fan and fan.state == "OFF":
+                prompt = "The fan is already OFF. Would you like me to do something else?"
+            else:
+                prompt = "You mentioned you're feeling cold. Would you like me to turn off the fan?"
+
+            self.context.set_pending(
+                session_id,
+                PendingClarification(
+                    interaction_id=None,
+                    question=prompt,
+                    intent=CONTROL_DEVICE,
+                    device_id="fan",
+                    action="OFF",
+                    needed_slot="action",
+                    candidates=["fan"],
+                ),
+            )
+            return Decision(
+                outcome=CLARIFY,
+                intent=CONTROL_DEVICE,
+                target_device="fan",
+                requested_action="OFF",
+                confidence=ir.confidence,
+                reason="Indirect statement expressing cold. Clarifying whether to turn off the fan.",
+                clarification_question=prompt,
+                message=prompt,
+                entities=ir.entities,
+            )
+
+        # 5. General Comfort / Settings ("Make it comfortable", "Change the settings")
+        prompt = "Would you like me to adjust the fan or the lights?"
+        self.context.set_pending(
+            session_id,
+            PendingClarification(
+                interaction_id=None,
+                question=prompt,
+                intent=CONTROL_DEVICE,
+                needed_slot="device",
+                candidates=["fan", "bedroom_light", "living_room_light"],
+            ),
+        )
+        return Decision(
+            outcome=CLARIFY,
+            intent=CONTROL_DEVICE,
+            confidence=ir.confidence,
+            reason="General comfort or settings request. Clarification required to identify target device.",
+            clarification_question=prompt,
+            message=prompt,
             entities=ir.entities,
         )
 

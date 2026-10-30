@@ -7,10 +7,15 @@ enrolled_voice.npy
 enrollment/*.wav
 model/
 
+# Database files
+*.db
+*.db-shm
+*.db-wal
+backend/*.db*
+
 # Backend
 backend/.venv/
 backend/.env
-backend/*.db*
 backend/__pycache__/
 
 # Frontend

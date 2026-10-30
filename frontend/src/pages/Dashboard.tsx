@@ -37,9 +37,11 @@ import {
   listDevices,
   commandDevice,
   processCommand,
+  processVoiceAudio,
   triggerEmergency,
 } from '../api/client';
 import type { ActivityResponse, Device, SystemStatus, VoiceProcessResponse } from '../api/types';
+import { AudioRecorder } from '../utils/audioRecorder';
 
 export default function Dashboard() {
   const [status, setStatus] = useState<SystemStatus | null>(null);
@@ -83,8 +85,8 @@ export default function Dashboard() {
     time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
   }));
 
-  // Speech Recognition Reference
-  const recognitionRef = useRef<any>(null);
+  // Audio Recorder Reference for speaker authentication
+  const audioRecorderRef = useRef<AudioRecorder | null>(null);
 
   // Fetch initial data
   const loadData = useCallback(() => {
@@ -168,58 +170,80 @@ export default function Dashboard() {
     }
   };
 
-  // Browser Speech Recognition
-  const toggleSpeechRecognition = () => {
-    const SpeechRecognition =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-
-    if (!SpeechRecognition) {
-      setListeningFeedback('Speech recognition not supported in this browser. Please use text input.');
-      setTimeout(() => setListeningFeedback(null), 4000);
-      return;
-    }
-
+  // Automatic Voice Authentication Recording
+  const toggleVoiceRecording = async () => {
     if (isListening) {
-      recognitionRef.current?.stop();
+      // User clicked to stop and verify
       setIsListening(false);
-      setListeningFeedback(null);
+      setListeningFeedback('Verifying speaker...');
+      setIsProcessing(true);
+      const nowTime = new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+
+      try {
+        const recorder = audioRecorderRef.current;
+        if (!recorder) return;
+        const audioBlob = await recorder.stop();
+        const res = await processVoiceAudio(audioBlob);
+
+        setLastCommand({
+          text: res.recognized_text || '[Voice command]',
+          time: nowTime,
+          intent: res.intent || 'UNKNOWN',
+          device: res.target_device || (res.entities?.device as string) || 'none',
+          action: res.requested_action || (res.entities?.action as string) || 'none',
+          confidence: res.speaker_similarity ?? 0.85,
+        });
+
+        setDecisionResult({
+          outcome: res.decision,
+          title: res.speaker_verified
+            ? 'Voice verified. Executing command.'
+            : 'Voice verification rejected.',
+          reason: res.decision_reason,
+          status: res.speaker_verified ? 'Verified' : 'Access Denied',
+          message: res.message,
+          time: nowTime,
+        });
+
+        if (res.speaker_verified) {
+          setListeningFeedback('Voice verified. Processing command.');
+        } else {
+          setListeningFeedback(res.message);
+        }
+
+        if (res.decision === 'ESCALATE') {
+          setEmergencyAlertActive(true);
+        }
+
+        loadData();
+      } catch (err: any) {
+        setListeningFeedback('Authentication failed due to a technical error.');
+        setDecisionResult({
+          outcome: 'REJECT',
+          title: 'Authentication Error',
+          reason: err.message || 'Technical failure',
+          status: 'Failed',
+          message: 'Voice verification could not be completed.',
+          time: nowTime,
+        });
+      } finally {
+        setIsProcessing(false);
+        setTimeout(() => setListeningFeedback(null), 4000);
+      }
       return;
     }
 
+    // Start recording
     try {
-      const recognition = new SpeechRecognition();
-      recognition.lang = 'en-US';
-      recognition.interimResults = false;
-      recognition.maxAlternatives = 1;
-
-      recognition.onstart = () => {
-        setIsListening(true);
-        setListeningFeedback('Listening... Speak your command now');
-      };
-
-      recognition.onresult = (event: any) => {
-        const transcript = event.results[0][0].transcript;
-        setListeningFeedback(`Transcribed: "${transcript}"`);
-        handleExecute(transcript);
-        setIsListening(false);
-      };
-
-      recognition.onerror = (event: any) => {
-        setIsListening(false);
-        setListeningFeedback(`Audio recognition: ${event.error || 'No speech detected'}`);
-        setTimeout(() => setListeningFeedback(null), 3500);
-      };
-
-      recognition.onend = () => {
-        setIsListening(false);
-      };
-
-      recognitionRef.current = recognition;
-      recognition.start();
-    } catch {
+      const recorder = new AudioRecorder();
+      audioRecorderRef.current = recorder;
+      await recorder.start();
+      setIsListening(true);
+      setListeningFeedback('Listening... Speak your command now. Click mic again when done.');
+    } catch (err: any) {
       setIsListening(false);
-      setListeningFeedback('Could not start microphone');
-      setTimeout(() => setListeningFeedback(null), 3000);
+      setListeningFeedback(`Microphone error: ${err.message || 'Permission denied'}`);
+      setTimeout(() => setListeningFeedback(null), 3500);
     }
   };
 
@@ -327,8 +351,10 @@ export default function Dashboard() {
             <div>
               <p className="text-sm font-semibold text-white">Voice Assistant</p>
               <div className="flex items-center gap-1.5 mt-0.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                <span className="text-xs text-slate-400">Ready</span>
+                <span className={`w-2 h-2 rounded-full ${status?.voice_enrolled ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'}`} />
+                <span className="text-xs text-slate-400">
+                  {status?.voice_enrolled ? 'Enrolled & Active' : 'Enrollment Required'}
+                </span>
               </div>
             </div>
           </div>
@@ -451,7 +477,7 @@ export default function Dashboard() {
               <div className="py-6 flex flex-col items-center justify-center text-center">
                 {/* Glowing Mic Button */}
                 <button
-                  onClick={toggleSpeechRecognition}
+                  onClick={toggleVoiceRecording}
                   disabled={isProcessing}
                   className={`w-28 h-28 rounded-full flex items-center justify-center transition-all cursor-pointer shadow-xl relative ${
                     isListening

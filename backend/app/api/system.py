@@ -24,8 +24,8 @@ def system_status(db: Session = Depends(get_db)):
 
     start_time = get_start_time()
 
-    vosk_path = Path(settings.vosk_model_path)
-    voice_path = Path(settings.enrolled_voice_path)
+    vosk_path = settings.get_vosk_model_path()
+    voice_path = settings.get_enrolled_voice_path()
 
     total_devices = db.query(Device).count()
     active_devices = db.query(Device).filter(Device.is_active.is_(True)).count()
