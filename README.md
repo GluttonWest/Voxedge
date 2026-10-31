@@ -1,283 +1,311 @@
-# VoxEdge — Reliability-Aware Assistive Voice System for Elderly Care
+# VoxEdge
 
-[![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![React](https://img.shields.io/badge/React-19-61DAFB?logo=react&logoColor=black)](https://react.dev)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?logo=typescript&logoColor=white)](https://typescriptlang.org)
-[![TailwindCSS](https://img.shields.io/badge/Tailwind-v4-38B2AC?logo=tailwind-css&logoColor=white)](https://tailwindcss.com)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+**VoxEdge** is a reliability-aware, voice-controlled assistive system for elderly, motor-impaired, and bedridden users. It combines offline speech recognition, speaker verification, deterministic intent handling, conversation context, simulated smart devices, and an emergency workflow in one local application.
 
-> **VoxEdge** is a research-oriented, voice-driven assistive system engineered specifically for elderly, motor-impaired, and bedridden individuals. It upgrades conventional rigid voice interfaces into a multi-turn, reliability-aware edge system featuring intent extraction, context-aware pronoun resolution, ambiguity clarification, and life-safety emergency escalation.
+The repository contains two usable experiences:
 
----
+- **Phase 1 desktop prototype:** an offline microphone loop that controls a Tkinter fan simulator after speaker verification.
+- **Phase 2 web application:** a FastAPI backend and React dashboard for voice/text commands, device control, safety decisions, conversation history, activity logs, emergency events, and evaluation.
 
-## 📑 Table of Contents
+> VoxEdge is a research/demo system. Device actions and emergency contacts are simulated; it is not a medical alert service or a replacement for emergency services.
 
-- [Motivation & Problem Statement](#motivation--problem-statement)
-- [System Architecture](#system-architecture)
-- [Phase 1 vs Phase 2 Comparison](#phase-1-vs-phase-2-comparison)
-- [Core Features](#core-features)
-- [Empirical Evaluation Benchmark](#empirical-evaluation-benchmark)
-- [Project Structure](#project-structure)
-- [Getting Started](#getting-started)
-  - [Prerequisites](#prerequisites)
-  - [Phase 1 (Legacy Prototype)](#running-phase-1-prototype)
-  - [Phase 2 Backend Setup](#running-phase-2-backend)
-  - [Phase 2 Frontend Setup](#running-phase-2-frontend)
-  - [Running Evaluation Suite](#running-the-evaluation-test-suite)
-- [API Documentation](#api-documentation)
-- [Research & Academic Significance](#research--academic-significance)
+## What it can do
 
----
+### Voice and authentication
 
-## Motivation & Problem Statement
+- Record three microphone samples and create a normalized 256-dimensional Resemblyzer speaker profile.
+- Transcribe WAV audio locally with Vosk.
+- Verify the speaker before executing voice commands.
+- Issue short-lived session tokens after successful voice verification.
+- Fail closed when there is no enrolled profile, invalid audio, a verification failure, or a voice-processing error.
+- Accept either recorded audio or typed text through the web dashboard.
 
-Commercial smart voice assistants (e.g., Alexa, Google Assistant) and basic keyword triggers suffer from critical failure modes when deployed for elderly and bedridden users:
-1. **Brittleness:** Strict keyword matching fails with dysarthric, trembling, or varied phrasing.
-2. **Lack of Conversational Memory:** Pronouns ("turn it off", "switch that one on") fail without multi-turn session tracking.
-3. **Unsafe Ambiguity Resolution:** Ambiguous commands ("turn off the light" when multiple exist) either guess unpredictably or fail silently.
-4. **Absence of Safety Protocols:** Medical distress utterances ("I can't breathe", "help me I've fallen") are completely ignored by traditional automation systems.
+### Natural-language command handling
 
-VoxEdge solves these challenges by combining offline speaker verification with a **four-stage deterministic decision engine** (`EXECUTE`, `CLARIFY`, `REJECT`, `ESCALATE`).
+The rule-based intent service recognizes:
 
----
+- Device control: turn devices **ON** or **OFF**.
+- Status checks such as “is the fan on?”
+- Help, confirmation, and cancellation responses.
+- Emergency phrases such as “I fell”, “help me”, and “I can’t breathe”.
+- Indirect requests such as “it’s too dark” and “I’m feeling hot”.
+- Unknown devices and unsupported actions, which are rejected instead of executed.
 
-## System Architecture
+Every command produces one of four explicit outcomes:
 
+| Outcome | Meaning |
+| --- | --- |
+| `EXECUTE` | The request is understood, authorized, and applied. |
+| `CLARIFY` | The request is plausible but ambiguous; the assistant asks a follow-up question. |
+| `REJECT` | The request is unsafe, unsupported, unauthenticated, malformed, or too uncertain. |
+| `ESCALATE` | A distress signal creates an emergency event and simulated contact dispatch. |
+
+### Context and safety
+
+- Resolve follow-ups such as “turn it off” using the recent session context.
+- Keep a bounded conversation history with a configurable retention limit.
+- Ask for clarification when multiple lights or another device target could match.
+- Support confirmation and cancellation of pending clarifications.
+- Use an optional local/ Ollama-compatible small-language-model proposal layer as a bounded aid; deterministic validation remains authoritative.
+- Record interaction and device-action audit data in SQLite.
+
+### Dashboard and monitoring
+
+The React dashboard includes:
+
+- Overview with live device status, recent decisions, emergency shortcut, and evaluation summary.
+- Voice Assistant for enrollment, audio commands, text commands, and conversation history.
+- Device Control for the simulated bedroom light, living-room light, and fan.
+- Activity for interaction and device-action history.
+- Emergency for triggering, reviewing, and updating simulated incidents.
+- Evaluation for running and filtering the baseline-versus-enhanced benchmark.
+
+## Architecture
+
+```text
+Microphone / typed text
+          |
+          v
+  Vosk transcription + Resemblyzer speaker verification
+          |
+          v
+ Intent extraction -> context resolution -> decision engine
+          |
+     +----+---------+-----------+-----------+
+     |              |           |           |
+ EXECUTE        CLARIFY     REJECT      ESCALATE
+ device state   follow-up   no action   emergency event
 ```
-                  ┌───────────────────────────────┐
-                  │    Microphone / Audio Input   │
-                  └───────────────┬───────────────┘
-                                  │
-                                  ▼
-                    ┌───────────────────────────┐
-                    │  Offline Vosk ASR Engine  │
-                    └─────────────┬─────────────┘
-                                  │ (Transcribed Text)
-                                  ▼
-                    ┌───────────────────────────┐
-                    │ Speaker Embedding (GE2E)  │
-                    │  (Resemblyzer Similarity) │
-                    └─────────────┬─────────────┘
-                                  │ (Confidence / Verification)
-                                  ▼
-      ┌───────────────────────────────────────────────────────┐
-      │          Reliability-Aware Decision Engine            │
-      │  ┌─────────────────┐ ┌───────────────┐ ┌───────────┐  │
-      │  │ Intent & Entity │ │ Multi-Turn    │ │ Safety &  │  │
-      │  │ Extraction      │ │ Context Cache │ │ Ambiguity │  │
-      │  └─────────────────┘ └───────────────┘ └───────────┘  │
-      └───────────────────────────┬───────────────────────────┘
-                                  │
-        ┌──────────────┬──────────┴───────────┬──────────────┐
-        ▼              ▼                      ▼              ▼
-  [ EXECUTE ]     [ CLARIFY ]            [ REJECT ]     [ ESCALATE ]
-  Device Action   Ask follow-up query    Confidence too  Emergency Alert
-  state updated   to disambiguate        low / Malformed Dispatched & Logged
-```
 
----
+The Phase 2 backend is organized into:
 
-## Phase 1 vs Phase 2 Comparison
+- `api/` — FastAPI routes for voice, decisions, devices, activity, emergency, system, and evaluation.
+- `services/` — intent extraction, decision policy, context, conversation retention, device simulation, emergency handling, evaluation, SLM proposals, and voice authentication.
+- `models/` and `schemas/` — SQLAlchemy persistence models and Pydantic request/response types.
 
-| Capability | Phase 1 (Baseline Prototype) | Phase 2 (VoxEdge Enhanced) |
-|---|---|---|
-| **Voice Processing** | Offline Vosk + Resemblyzer | Vosk + Resemblyzer + REST audio endpoint |
-| **Parsing Technique** | Hardcoded keyword check ("fan on/off") | Rule-based Intent & Entity Extractor |
-| **Supported Devices** | Single simulated Fan only | Multi-room (Bedroom Light, Living Room Light, Fan) |
-| **Decision Outcomes** | Binary (Accepted / Access Denied) | 4-way (`EXECUTE`, `CLARIFY`, `REJECT`, `ESCALATE`) |
-| **Context Memory** | None (stateless) | Multi-turn session tracking with pronoun resolution |
-| **Ambiguity Handling** | Fails silently | Proactive clarification question |
-| **Emergency Detection**| None (ignored) | Immediate escalation & contact dispatch simulation |
-| **Persistence** | In-memory only | SQLite relational database with SQLAlchemy ORM |
-| **User Interface** | Tkinter Desktop Canvas | Modern React 19 + TypeScript + Tailwind v4 Web App |
-| **Observability** | Terminal console logs | Audit trail, state logs, and interactive evaluation page |
+## Repository layout
 
----
-
-## Core Features
-
-- 🎙️ **Voice & Text Multimodal Assistant:** Full conversational interface supporting live microphone recording or typed text commands with instant decision badge feedback.
-- 💡 **Multi-Device Simulation:** Real-time state management for living room lights, bedroom lights, and ceiling fans with toggle control, power consumption indicators, and visual glowing effects.
-- 🧠 **Context & Pronoun Resolution:** Resolves anaphoric expressions (e.g. "turn it off", "switch that one back on") using recent session interaction history.
-- ❓ **Safety Disambiguation:** When an ambiguous command is uttered (e.g. "turn off the light"), the engine pauses execution and prompts for user clarification.
-- 🚨 **Emergency Escalation Protocol:** Detects distress signals ("help me", "I fell", "can't breathe"), creates high-priority incidents, and triggers automated emergency contact dispatches.
-- 📊 **Empirical Evaluation Dashboard:** Real-time benchmark page with Recharts visualizing baseline vs enhanced comparative metrics.
-
----
-
-## Empirical Evaluation Benchmark
-
-The system includes a 13-case gold-standard evaluation framework comparing Phase 1 against Phase 2:
-
-| Metric | Phase 1 Baseline | Phase 2 Enhanced | Delta |
-|---|---|---|---|
-| **Command Accuracy** | 46.2% | **100.0%** | **+53.8%** |
-| **Safety Compliance** | 0.0% | **100.0%** | **+100.0%** |
-| **Usability & Clarification** | 0.0% | **100.0%** | **+100.0%** |
-| **Context Resolution** | 0.0% (Failed) | **100.0%** (Resolved) | **+100.0%** |
-
-*Run the benchmark locally via pytest or view the live interactive charts on the web UI at `/evaluation`.*
-
----
-
-## Project Structure
-
-```
+```text
 Voxedge/
-├── backend/                    # FastAPI Backend Application
+├── backend/
 │   ├── app/
-│   │   ├── api/                # REST API Routers (voice, devices, decisions, activity, emergency, evaluation)
-│   │   ├── core/               # Configuration, security, CORS settings
-│   │   ├── database/           # SQLite connection, SessionLocal, init_db
-│   │   ├── models/             # SQLAlchemy ORM models (Device, Interaction, Decision, Emergency)
-│   │   ├── schemas/            # Pydantic v2 validation schemas
-│   │   ├── services/           # DecisionEngine, IntentService, ContextService, DeviceSimulator, Evaluation
-│   │   └── main.py             # FastAPI entry point & lifespan handler
-│   └── tests/
-│       └── test_evaluation.py  # Automated evaluation test suite (13 test conditions)
-│
-├── frontend/                   # Modern React Web Dashboard
+│   │   ├── api/              # REST endpoints
+│   │   ├── core/             # Environment-backed settings
+│   │   ├── database/         # SQLite session and table initialization
+│   │   ├── models/           # Device, interaction, activity, emergency models
+│   │   ├── schemas/          # API validation schemas
+│   │   └── services/         # Core voice, intent, context, decision, and safety logic
+│   ├── tests/                # Feature and evaluation tests
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
 │   ├── src/
-│   │   ├── api/                # Type-safe API client functions
-│   │   ├── components/         # Sidebar, Layout, Navigation
-│   │   ├── pages/              # Dashboard, VoiceAssistant, DeviceControl, ActivityPage, EmergencyPage, EvaluationPage
-│   │   ├── App.tsx             # Route definitions
-│   │   └── main.tsx            # React root entry
-│   ├── index.html              # HTML shell with Inter typography & metadata
-│   ├── vite.config.ts          # Vite build configuration with Tailwind CSS v4
-│   └── package.json            # Node dependencies
-│
-├── enrollment/                 # Audio recordings for speaker enrollment
-├── enroll.py                   # GE2E voice embedding generator
-├── record_enrollment.py        # 3x audio recorder for user enrollment
-├── fan_simulator.py            # Phase 1 Tkinter animation GUI
-├── main.py                     # Phase 1 offline voice control loop
-└── requirements.txt            # Python dependencies for Phase 1
+│   │   ├── api/              # Typed backend client
+│   │   ├── components/       # Shared layout
+│   │   └── pages/            # Dashboard application views
+│   └── package.json
+├── model/                    # Vosk model assets expected by the local ASR pipeline
+├── enrollment/               # Generated WAV samples (ignored by Git)
+├── main.py                   # Phase 1 offline voice loop
+├── fan_simulator.py          # Phase 1 Tkinter output simulator
+├── record_enrollment.py      # Record three enrollment clips
+├── enroll.py                 # Build enrolled_voice.npy
+├── requirements.txt          # Phase 1 Python dependencies
+└── start_*.bat               # Windows launch helpers
 ```
 
----
+## Requirements
 
-## Getting Started
+- Python 3.11 or newer
+- Node.js and npm (the frontend uses Vite)
+- A working microphone for enrollment and live audio commands
+- A local Vosk model in `model/`
+- Tkinter for the Phase 1 desktop simulator
 
-### Prerequisites
+The repository currently contains Vosk model assets. If your checkout does not contain a usable model, download a compatible English model from the [Vosk models page](https://alphacephei.com/vosk/models) and extract it as `model/`.
 
-- **Python 3.11+** installed
-- **Node.js 18+** & npm installed
-- **Vosk Acoustic Model:** Download [`vosk-model-small-en-us-0.15`](https://alphacephei.com/vosk/models), extract, and place in `Voxedge/model/`.
+## Setup
 
----
+### 1. Create a voice profile
 
-### Running Phase 1 Prototype
+From the repository root:
 
-```powershell
-# In the root repository directory:
+```bash
 python -m venv .venv311
-.venv311\Scripts\activate
-pip install -r requirements.txt
+```
 
-# Voice enrollment (one-time):
+Activate the environment:
+
+```bash
+# macOS/Linux
+source .venv311/bin/activate
+
+# Windows PowerShell
+.venv311\Scripts\Activate.ps1
+```
+
+Install the Phase 1 dependencies and create the profile:
+
+```bash
+pip install -r requirements.txt
 python record_enrollment.py
 python enroll.py
+```
 
-# Run Tkinter fan controller:
+`record_enrollment.py` records exactly three non-silent, three-second clips in `enrollment/`. `enroll.py` averages their Resemblyzer embeddings and writes `enrolled_voice.npy` at the repository root. Add `--force` to `enroll.py` to replace an existing profile without an interactive prompt.
+
+### 2. Run the Phase 1 desktop prototype
+
+```bash
 python main.py
 ```
 
----
+Press Enter to record a command. The prototype transcribes the audio, checks the enrolled speaker, recognizes fan commands such as “turn on the fan” and “turn off the fan”, and updates the Tkinter fan simulator. No physical hardware is controlled.
 
-### Running Phase 2 Backend
+### 3. Install backend dependencies
 
-```powershell
+```bash
 cd backend
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+```
 
-# Start backend on http://127.0.0.1:8000
+Activate `.venv` using the same platform-specific commands above, then install:
+
+```bash
+pip install -r requirements.txt
+```
+
+Optional configuration:
+
+```bash
+cp .env.example .env       # macOS/Linux
+copy .env.example .env     # Windows
+```
+
+The defaults are suitable for local development. Important settings include:
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./voxedge.db` | SQLite database location |
+| `VOSK_MODEL_PATH` | `../model` | Vosk model directory when running from `backend/` |
+| `ENROLLED_VOICE_PATH` | `../enrolled_voice.npy` | Saved speaker embedding |
+| `SIMILARITY_THRESHOLD` | `0.65` | Speaker verification threshold |
+| `INTENT_CONFIDENCE_THRESHOLD` | `0.6` | Minimum intent confidence |
+| `CONTEXT_EXPIRY_SECONDS` | `120` | Context lifetime for pronoun resolution |
+| `MAX_CLARIFICATION_ATTEMPTS` | `2` | Clarification retry limit |
+| `MAX_CONVERSATION_HISTORY` | `50` | Retained turns per session |
+| `SLM_PROVIDER` | `local` | `local`, `ollama`, or `mock` proposal provider |
+| `SLM_MODEL_NAME` | `qwen2.5-0.5b` | SLM model name |
+| `SLM_API_BASE` | `http://localhost:11434` | Ollama-compatible endpoint |
+| `EMERGENCY_AUTO_TIMEOUT_SECONDS` | `300` | Emergency timeout setting |
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | Backend bind address |
+| `CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Allowed frontend origins |
+
+The backend uses SQLite and creates/seeds the default devices on startup. Database files are ignored by Git.
+
+### 4. Start the Phase 2 backend
+
+From `backend/`:
+
+```bash
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
 ```
-Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 
----
+Open the generated API documentation at <http://127.0.0.1:8000/docs>. The root health response is available at <http://127.0.0.1:8000/>.
 
-### Running Phase 2 Frontend
+### 5. Start the frontend
 
-```powershell
+In another terminal:
+
+```bash
 cd frontend
 npm install
 npm run dev
 ```
-Open `http://localhost:5173` in your browser.
 
----
+Open <http://localhost:5173>. Vite proxies `/api` requests to `http://127.0.0.1:8000`.
 
-### Running the Evaluation Test Suite
+For a production frontend build:
 
-To run the automated research benchmark comparison:
+```bash
+npm run build
+```
 
-```powershell
+The frontend also provides `npm run lint`.
+
+### Windows shortcut
+
+After creating `.venv311`, installing the root and backend dependencies, and running `npm install` in `frontend/`, `start_voxedge.bat` launches the backend and frontend in separate command windows. The individual `start_backend.bat` and `start_frontend.bat` scripts can be used when only one service is needed.
+
+## API reference
+
+The backend registers the primary routes both directly and under the `/api` namespace. The frontend uses `/api`.
+
+| Method | Frontend path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/voice/enrollment-status` | Check whether a voice profile exists. |
+| `POST` | `/api/voice/enroll` | Upload an enrollment recording (`multipart/form-data`). |
+| `DELETE` | `/api/voice/profile` | Remove the enrolled voice profile. |
+| `POST` | `/api/voice/process-audio` | Verify a WAV command and process it. |
+| `POST` | `/api/voice/process` | Process typed text, optionally with a session ID. |
+| `GET` | `/api/voice/history` | Read bounded conversation history for a session. |
+| `DELETE` | `/api/voice/history` | Clear history and context for a session. |
+| `GET` | `/api/voice/context` | Inspect the current session context. |
+| `POST` | `/api/decisions/confirm` | Answer a pending clarification or confirmation. |
+| `GET` | `/api/devices` | List active simulated devices and states. |
+| `GET` | `/api/devices/{device_id}` | Read one device. |
+| `POST` | `/api/devices/{device_id}/command` | Directly control a device. Requires an `Authorization` header containing the issued session token. |
+| `GET` | `/api/activity` | Read interaction and device-action audit history. |
+| `POST` | `/api/emergency/trigger` | Create a simulated emergency event. |
+| `GET` | `/api/emergency` | List emergency events. |
+| `GET` | `/api/emergency/{event_id}` | Read one emergency event. |
+| `PUT` | `/api/emergency/{event_id}` | Update an emergency status and notes. |
+| `GET` | `/api/system/status` | Read health, model, enrollment, counts, and uptime. |
+| `GET` | `/api/evaluation/run` | Run the baseline-versus-enhanced benchmark. |
+
+Voice verification returns a session token on successful authentication. The frontend stores it locally and sends it for authenticated text, confirmation, and direct device-control requests. Emergency triggering is intentionally available as a simulated workflow and does not contact real emergency services.
+
+## Evaluation and tests
+
+Run the backend tests from the repository root:
+
+```bash
 cd backend
-.venv\Scripts\pytest tests/test_evaluation.py -v -s
+pytest -q
 ```
 
-Sample output:
-```
-==========================================================================================
-VOXEDGE EVALUATION RESULTS - BASELINE vs ENHANCED
-==========================================================================================
-ID    Command                             Cat          Expected   Base   Enh    Enh Dec   
-------------------------------------------------------------------------------------------
-C1    turn on the fan                     correctness  EXECUTE    [OK]   [OK]   EXECUTE   
-C2    turn off the fan                    correctness  EXECUTE    [OK]   [OK]   EXECUTE   
-C3    turn on the bedroom light           correctness  EXECUTE    [X]    [OK]   EXECUTE   
-C4    switch off the living room light    correctness  EXECUTE    [X]    [OK]   EXECUTE   
-C5    fan off                             correctness  EXECUTE    [OK]   [OK]   EXECUTE   
-U1    turn off the light                  usability    CLARIFY    [OK]   [OK]   CLARIFY   
-U2    what can you do                     usability    REJECT     [OK]   [OK]   REJECT    
-U3    blah blah random words              usability    REJECT     [OK]   [OK]   REJECT    
-X1    turn it off                         context      EXECUTE    [X]    [OK]   EXECUTE   
-S1    help me I've fallen                 safety       ESCALATE   [X]    [OK]   ESCALATE  
-S2    call for help please                safety       ESCALATE   [X]    [OK]   ESCALATE  
-S3    I can't breathe                     safety       ESCALATE   [X]    [OK]   ESCALATE  
-C6    is the fan on                       correctness  EXECUTE    [X]    [OK]   EXECUTE   
-------------------------------------------------------------------------------------------
-Accuracy                  46.2%           100.0%           +53.8%
-Safety Rate               0.0%            100.0%           +100.0%
-Usability                 0.0%            100.0%           +100.0%
-==========================================================================================
-```
+The tests cover:
 
----
+- Baseline-versus-enhanced evaluation behavior.
+- Intent extraction and ambiguity handling.
+- Indirect requests and pronoun resolution.
+- Confirmation, cancellation, and conversation retention.
+- Speaker enrollment, verification, malformed audio, and fail-closed behavior.
+- Authentication requirements for direct device control.
+- Emergency escalation and device execution failure logging.
 
-## API Documentation
+The web evaluation page and `GET /api/evaluation/run` expose the same benchmark data used by the evaluation service.
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `POST` | `/api/voice/process-text` | Process typed command with intent & decision engine |
-| `POST` | `/api/voice/process-audio` | Upload WAV audio for Vosk transcription + decision |
-| `GET` | `/api/devices/` | List all registered smart devices and states |
-| `POST` | `/api/devices/{id}/action` | Manually dispatch device action (`ON`/`OFF`) |
-| `GET` | `/api/activity/` | Retrieve interaction logs and device state transitions |
-| `GET` | `/api/emergency/` | List logged emergency events |
-| `POST` | `/api/emergency/trigger` | Trigger emergency escalation workflow |
-| `POST` | `/api/emergency/{id}/resolve`| Mark emergency incident as resolved |
-| `GET` | `/api/evaluation/run` | Execute baseline vs enhanced benchmark test suite |
-| `GET` | `/api/system/health` | Backend health, DB connectivity, and uptime |
+## Default simulated devices
 
----
+On the first backend startup, SQLite is seeded with:
 
-## Research & Academic Significance
+| ID | Name | Type | Location | Actions |
+| --- | --- | --- | --- | --- |
+| `bedroom_light` | Bedroom Light | Light | Bedroom | `ON`, `OFF` |
+| `living_room_light` | Living Room Light | Light | Living room | `ON`, `OFF` |
+| `fan` | Fan | Fan | Bedroom | `ON`, `OFF` |
 
-VoxEdge demonstrates that edge voice assistants can transition from fragile keyword matching to **fault-tolerant, safety-critical decision systems** without relying on external cloud APIs. 
+All state changes are simulated and persisted in the local database. No real appliances are contacted.
 
-Key contributions:
-1. **Deterministic Edge Safety:** Explicit disambiguation and refusal logic prevent accidental activations that could cause physical distress.
-2. **Context-Preserving Anaphora Resolution:** Empirically verified conversational continuity for users unable to repeat long device names.
-3. **Medical & Physical Fall Interception:** Continuous monitoring for distress utterances connected to an emergency dispatch protocol.
+## Security and operational notes
 
----
+- Keep `AUTH_SECRET_KEY` private and override the development default before exposing the backend beyond localhost.
+- Use HTTPS and a real secret-management solution for any non-demo deployment.
+- The default CORS list is intended for local development.
+- Do not commit `enrolled_voice.npy`, enrollment recordings, `.env`, or generated database files.
+- The emergency subsystem records events and simulated notifications; it does not replace a certified emergency response system.
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+No license file is currently included in the repository. Add a license before distributing or deploying VoxEdge.
